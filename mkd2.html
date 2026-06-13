@@ -355,6 +355,14 @@ let state = {
   lastCheckAdmin: null,
   lastCheckUser: null,
   newTicketIds: new Set(),
+  notifTickets: [],
+  readTicketIds: new Set(),
+  knownTicketIds: new Set(),
+  highlightUnread: new Set(),
+  adminPrimed: false,
+  userSeen: {},
+  userPrimed: false,
+  userReadIds: new Set(),
   updatedTicketIds: new Set(),
   soundOn: false,
   audioCtx: null,
@@ -463,18 +471,15 @@ function toggleSound() {
    LOGIN
    ============================================================= */
 async function loadLoginData() {
-  try {
-    const [d, p] = await Promise.all([apiGet('getDepts'), apiGet('getPositions')]);
-    if (d.ok) {
-      state.depts = d.departments;
-      const sel = document.getElementById('loginDept');
-      sel.innerHTML = '<option value="">-- เลือกแผนก --</option>' +
-        state.depts.map(x => `<option value="${x.id}">${x.name}</option>`).join('');
-    }
-    if (p.ok) state.positions = p.positions;
-  } catch(e) {
-    toast('เชื่อมต่อล้มเหลว', 'ตรวจสอบ GAS URL ในไฟล์ HTML', 'error');
+  const [d, p] = await Promise.all([apiGet('getDepts'), apiGet('getPositions')]);
+  if (d.ok) {
+    state.depts = d.departments;
+    const sel = document.getElementById('loginDept');
+    if (sel) sel.innerHTML = '<option value="">-- เลือกแผนก --</option>' +
+      state.depts.map(x => `<option value="${x.id}">${x.name}</option>`).join('');
   }
+  if (p.ok) state.positions = p.positions;
+  if (!d.ok && !p.ok) throw new Error('load failed');
 }
 
 function onDeptChange() {
@@ -535,7 +540,7 @@ function logout(silent) {
   }
 }
 
-/* ===== SESSION (localStorage + expiry 12 ชม. — refresh แล้วไม่เด้งออก) ===== */
+/* ===== SESSION (localStorage + cookie สำรอง — refresh แล้วไม่เด้งออก แม้บน in-app browser) ===== */
 const SESSION_KEY = 'mkd2_session';
 const SESSION_HOURS = 12;
 
@@ -544,25 +549,44 @@ function saveSession() {
     user: state.user,
     expires: Date.now() + SESSION_HOURS * 60 * 60 * 1000
   };
-  localStorage.setItem(SESSION_KEY, JSON.stringify(payload));
+  const json = JSON.stringify(payload);
+  // 1) localStorage
+  try { localStorage.setItem(SESSION_KEY, json); } catch(e) {}
+  // 2) cookie สำรอง (สำหรับ in-app browser / Safari ที่ localStorage ไม่ทนข้าม refresh)
+  try {
+    const maxAge = SESSION_HOURS * 60 * 60;
+    document.cookie = SESSION_KEY + '=' + encodeURIComponent(json) + ';path=/;max-age=' + maxAge + ';SameSite=Lax';
+  } catch(e) {}
 }
 
 function loadSession() {
+  let raw = null;
+  try { raw = localStorage.getItem(SESSION_KEY); } catch(e) {}
+  if (!raw) raw = getCookieVal(SESSION_KEY); // fallback อ่านจาก cookie
+  if (!raw) return null;
   try {
-    const raw = localStorage.getItem(SESSION_KEY);
-    if (!raw) return null;
     const payload = JSON.parse(raw);
     if (!payload.expires || Date.now() > payload.expires) {
       clearSession();
       return null;
     }
+    // sync กลับเข้า localStorage เผื่อ refresh ครั้งถัดไป
+    try { localStorage.setItem(SESSION_KEY, raw); } catch(e) {}
     return payload.user;
   } catch(e) { return null; }
 }
 
 function clearSession() {
-  localStorage.removeItem(SESSION_KEY);
-  sessionStorage.removeItem('mkd2_user'); // ล้างของเก่าด้วย
+  try { localStorage.removeItem(SESSION_KEY); } catch(e) {}
+  try { sessionStorage.removeItem('mkd2_user'); } catch(e) {}
+  try { document.cookie = SESSION_KEY + '=;path=/;max-age=0'; } catch(e) {}
+}
+
+function getCookieVal(name) {
+  try {
+    const m = document.cookie.match(new RegExp('(?:^|; )' + name.replace(/([.*+?^${}()|[\]\\])/g,'\\$1') + '=([^;]*)'));
+    return m ? decodeURIComponent(m[1]) : null;
+  } catch(e) { return null; }
 }
 
 /* ===== AUTO-LOGOUT เมื่อไม่ใช้งาน 30 นาที ===== */
@@ -1187,10 +1211,9 @@ async function loadAdminTickets() {
   if (!r.ok) { container.innerHTML = '<div class="empty-state"><div class="icon">⚠️</div></div>'; return; }
   
   state.tickets = r.tickets;
+  // เก็บ id ที่ยังไม่อ่านไว้ ก่อนเคลียร์ เพื่อไฮไลต์ในรายการ
+  state.highlightUnread = new Set(state.notifTickets ? state.notifTickets.map(t => t.ticketId) : []);
   renderAdminTickets();
-  // clear new ticket highlights when admin opens this tab
-  state.newTicketIds.clear();
-  updateBellBadge();
 }
 
 function renderAdminTickets() {
@@ -1262,7 +1285,8 @@ function renderAdminTicketsList() {
   
   const container = document.getElementById('adminTicketList');
   if (list.length === 0) { container.innerHTML = '<div class="empty-state"><div class="title">ไม่มี Ticket ตรงเงื่อนไข' + (q ? ' กับคำค้น "' + escapeHtml(q) + '"' : '') + '</div></div>'; return; }
-  container.innerHTML = '<div style="margin-bottom:8px;font-size:13px;color:var(--gray-500);">พบ ' + list.length + ' รายการ</div>' + list.map(t => ticketCardHTML(t, state.newTicketIds.has(t.ticketId))).join('');
+  const hl = state.highlightUnread || new Set();
+  container.innerHTML = '<div style="margin-bottom:8px;font-size:13px;color:var(--gray-500);">พบ ' + list.length + ' รายการ</div>' + list.map(t => ticketCardHTML(t, hl.has(t.ticketId))).join('');
 }
 
 /* ===== TICKET DETAIL MODAL ===== */
@@ -1273,10 +1297,18 @@ async function openTicketDetail(ticketId) {
   state.pendingStatus = r.ticket.status;
   state.pendingAdminNote = r.ticket.adminNote;
   
-  // clear from new updates list
-  state.updatedTicketIds.delete(ticketId);
-  state.newTicketIds.delete(ticketId);
-  updateBellBadge();
+  // ทำเครื่องหมายว่า "อ่านแล้ว"
+  if (state.user.isAdmin) {
+    markTicketRead(ticketId);  // เก็บลง localStorage + ถอดออกจากกระดิ่ง
+  } else {
+    // ฝั่ง user: ถอดออกจาก badge อัปเดต
+    state.updatedTicketIds.delete(ticketId);
+    if (state.userReadIds) {
+      state.userReadIds.add(ticketId);
+      saveReadIds('mkd2_user_read_' + state.user.deptId, state.userReadIds);
+    }
+    updateUserBadge();
+  }
   
   renderTicketModal();
   document.getElementById('ticketModal').classList.add('show');
@@ -2023,55 +2055,88 @@ async function submitChangePassword() {
    POLLING & NOTIFICATIONS
    ============================================================= */
 async function startAdminPoll() {
-  // Initial check
-  state.lastCheckAdmin = localStorage.getItem('mkd2_admin_lastcheck') || null;
-  
+  // โหลดรายการ ticket ที่ "อ่านแล้ว" จาก localStorage (คงอยู่ข้ามการ refresh)
+  state.readTicketIds = loadReadIds('mkd2_admin_read');
+  state.knownTicketIds = new Set();   // ticket ที่เคยเห็นใน session นี้ (กันเด้งซ้ำ)
+  state.adminPrimed = false;          // false = poll แรก (baseline ไม่เด้ง)
+  state.notifTickets = [];            // เก็บข้อมูล ticket ที่ยังไม่อ่าน ไว้โชว์ใน dropdown
+
   const tick = async () => {
     try {
-      const r = await apiGet('pollAdmin', { lastCheck: state.lastCheckAdmin });
-      if (r.ok && r.newTickets && r.newTickets.length > 0) {
-        // Filter: ignore tickets created before this session if lastCheck was null
-        const fresh = r.newTickets.filter(t => state.lastCheckAdmin || false); // first tick = no notifs
-        
-        if (state.lastCheckAdmin) {
-          // Real new tickets
-          r.newTickets.forEach(t => {
-            state.newTicketIds.add(t.ticketId);
+      const r = await apiGet('pollAdmin', {});
+      if (!r.ok || !r.tickets) return;
+      const tickets = r.tickets;
+
+      if (!state.adminPrimed) {
+        // ── Poll แรกของ session: ตั้ง baseline ไม่เด้งแจ้งเตือน ──
+        tickets.forEach(t => state.knownTicketIds.add(t.ticketId));
+        state.adminPrimed = true;
+      } else {
+        // ── หา ticket ที่เพิ่งเข้ามาใหม่ (ไม่เคยเห็นใน session นี้) ──
+        const fresh = tickets.filter(t => !state.knownTicketIds.has(t.ticketId));
+        // เด้งเฉพาะอันที่ "ยังไม่อ่าน" เท่านั้น
+        const freshUnread = fresh.filter(t => !state.readTicketIds.has(t.ticketId));
+
+        fresh.forEach(t => state.knownTicketIds.add(t.ticketId));
+
+        if (freshUnread.length > 0) {
+          freshUnread.forEach(t => {
             const prioLabel = t.priority === 'urgent' ? '🔴 เร่งด่วน' : t.priority === 'low' ? '🟢' : '🟡';
-            toast(`${prioLabel} Ticket ใหม่จาก ${t.deptName}`, t.title, 'info', () => {
-              switchTab('allTickets');
-            });
+            // toast แจ้งเตือน (ไม่ refresh หน้า — กดเพื่อเปิดอ่านเองได้)
+            toast(`${prioLabel} Ticket ใหม่จาก ${t.deptName}`, t.title, 'info', () => openTicketDetail(t.ticketId));
           });
-          playDing();
-          updateBellBadge();
-          updateNotifList(r.newTickets);
-          
-          // Refresh tickets list if open
-          if (state.currentTab === 'allTickets') loadAdminTickets();
-          if (state.currentTab === 'dashboard') loadDashboard();
+          playDing();  // ส่งเสียงเตือน
         }
-        
-        state.lastCheckAdmin = r.serverTime;
-        localStorage.setItem('mkd2_admin_lastcheck', r.serverTime);
-      } else if (r.ok) {
-        state.lastCheckAdmin = r.serverTime;
-        localStorage.setItem('mkd2_admin_lastcheck', r.serverTime);
       }
+
+      // อัปเดตรายการ "ยังไม่อ่าน" = ticket ทั้งหมดที่ยังไม่อยู่ใน readTicketIds
+      state.notifTickets = tickets.filter(t => !state.readTicketIds.has(t.ticketId));
+      // เรียงใหม่ล่าสุดอยู่บน
+      state.notifTickets.sort((a,b) => String(b.createdAt).localeCompare(String(a.createdAt)));
+      updateBellBadge();
+      // ไม่ refresh รายการ/dashboard อัตโนมัติ — ให้ Admin รีเฟรชเข้าไปอ่านเอง
     } catch(e) {
       console.warn('Poll failed', e);
     }
   };
-  
-  // Don't await initial tick - just start the timer
+
   await tick();
   state.pollTimer = setInterval(tick, 30000);
 }
 
+/* ===== READ-IDS helpers (เก็บใน localStorage) ===== */
+function loadReadIds(key) {
+  try {
+    const raw = localStorage.getItem(key);
+    if (!raw) return new Set();
+    return new Set(JSON.parse(raw));
+  } catch(e) { return new Set(); }
+}
+
+function saveReadIds(key, set) {
+  try {
+    // เก็บแค่ 500 รายการล่าสุดพอ กันบวม
+    const arr = Array.from(set).slice(-500);
+    localStorage.setItem(key, JSON.stringify(arr));
+  } catch(e) {}
+}
+
+function markTicketRead(ticketId) {
+  if (!state.readTicketIds) state.readTicketIds = new Set();
+  if (state.readTicketIds.has(ticketId)) return;
+  state.readTicketIds.add(ticketId);
+  saveReadIds('mkd2_admin_read', state.readTicketIds);
+  // ถอดออกจากรายการแจ้งเตือน
+  if (state.notifTickets) state.notifTickets = state.notifTickets.filter(t => t.ticketId !== ticketId);
+  updateBellBadge();
+}
+
 function updateBellBadge() {
   const badge = document.getElementById('bellBadge');
-  const count = state.newTicketIds.size;
+  if (!badge) return;
+  const count = state.notifTickets ? state.notifTickets.length : 0;
   if (count > 0) {
-    badge.textContent = count;
+    badge.textContent = count > 99 ? '99+' : count;
     badge.style.display = 'flex';
   } else {
     badge.style.display = 'none';
@@ -2080,25 +2145,27 @@ function updateBellBadge() {
 
 function updateNotifList(items) {
   const list = document.getElementById('notifList');
-  if (state.newTicketIds.size === 0) {
-    list.innerHTML = '<div class="notif-empty">ไม่มีการแจ้งเตือน</div>';
+  const data = items || state.notifTickets || [];
+  if (data.length === 0) {
+    list.innerHTML = '<div class="notif-empty">ไม่มี Ticket ที่ยังไม่อ่าน</div>';
     return;
   }
-  // Build from state.newTicketIds + cached items
-  const html = items.slice(0, 10).map(t => `
-    <div class="notif-item" onclick="openTicketDetail('${t.ticketId}');toggleNotifDropdown();">
-      <div class="notif-title">${escapeHtml(t.title)}</div>
-      <div class="notif-meta">🏢 ${escapeHtml(t.deptName)} • 🕒 ${escapeHtml(String(t.createdAt))}</div>
-    </div>
-  `).join('');
-  list.innerHTML = html;
+  list.innerHTML = data.slice(0, 15).map(t => {
+    const prio = t.priority === 'urgent' ? '🔴 ' : '';
+    return `
+      <div class="notif-item" onclick="openTicketDetail('${t.ticketId}');toggleNotifDropdown();">
+        <div class="notif-title">${prio}${escapeHtml(t.title)}</div>
+        <div class="notif-meta">🏢 ${escapeHtml(t.deptName || '')} • 🕒 ${escapeHtml(String(t.createdAt || ''))}</div>
+      </div>
+    `;
+  }).join('');
 }
 
 function toggleNotifDropdown() {
   const dd = document.getElementById('notifDropdown');
   dd.classList.toggle('show');
-  if (dd.classList.contains('show') && state.newTicketIds.size === 0) {
-    document.getElementById('notifList').innerHTML = '<div class="notif-empty">ไม่มีการแจ้งเตือน</div>';
+  if (dd.classList.contains('show')) {
+    updateNotifList(); // โชว์รายการที่ยังไม่อ่านล่าสุด
   }
 }
 
@@ -2112,40 +2179,55 @@ document.addEventListener('click', (e) => {
 });
 
 async function startUserPoll() {
-  state.lastCheckUser = localStorage.getItem('mkd2_user_lastcheck') || null;
-  
+  // จำสถานะอัปเดตล่าสุดของแต่ละ ticket (ticketId -> updatedAt) เพื่อตรวจว่ามีอัปเดตใหม่ไหม
+  state.userSeen = {};
+  state.userPrimed = false;
+  state.userReadIds = loadReadIds('mkd2_user_read_' + state.user.deptId);
+
   const tick = async () => {
     try {
-      const r = await apiGet('pollUser', { deptId: state.user.deptId, lastCheck: state.lastCheckUser });
-      if (r.ok && r.updated && r.updated.length > 0) {
-        if (state.lastCheckUser) {
-          r.updated.forEach(u => {
-            state.updatedTicketIds.add(u.ticketId);
-            const statusText = { pending: 'รอดำเนินการ', inProgress: 'กำลังดำเนินการ', resolved: 'แล้วเสร็จ' };
-            toast(`Ticket อัปเดตแล้ว`, `${u.title} → ${statusText[u.status]}`, 'info', () => {
-              switchTab('myTickets');
-            });
-          });
-          // Update badge
-          const badge = document.getElementById('myTicketsBadge');
-          if (badge) {
-            badge.textContent = state.updatedTicketIds.size;
-            badge.style.display = 'inline-flex';
+      const r = await apiGet('pollUser', { deptId: state.user.deptId });
+      if (!r.ok || !r.tickets) return;
+      const tickets = r.tickets;
+
+      if (!state.userPrimed) {
+        // Baseline: จำสถานะปัจจุบัน ไม่เด้ง
+        tickets.forEach(t => { state.userSeen[t.ticketId] = t.updatedAt; });
+        state.userPrimed = true;
+      } else {
+        const statusText = { pending: 'รอดำเนินการ', inProgress: 'กำลังดำเนินการ', resolved: 'แล้วเสร็จ' };
+        tickets.forEach(t => {
+          const prev = state.userSeen[t.ticketId];
+          // มีอัปเดตใหม่ = updatedAt เปลี่ยนไปจากที่เคยเห็น
+          if (prev !== undefined && prev !== t.updatedAt) {
+            state.updatedTicketIds.add(t.ticketId);
+            // ถอดออกจาก read (เพราะมีอัปเดตใหม่ ให้ถือว่ายังไม่อ่าน)
+            state.userReadIds.delete(t.ticketId);
+            toast('Ticket อัปเดตแล้ว', `${t.title} → ${statusText[t.status] || t.status}`, 'info', () => switchTab('myTickets'));
+            playDing();
           }
-          // Refresh if on tab
-          if (state.currentTab === 'myTickets') loadMyTickets();
-        }
-        state.lastCheckUser = r.serverTime;
-        localStorage.setItem('mkd2_user_lastcheck', r.serverTime);
-      } else if (r.ok) {
-        state.lastCheckUser = r.serverTime;
-        localStorage.setItem('mkd2_user_lastcheck', r.serverTime);
+          state.userSeen[t.ticketId] = t.updatedAt;
+        });
+        updateUserBadge();
+        // ไม่ refresh หน้าอัตโนมัติ — ให้ user กดเข้าไปดูเอง
       }
     } catch(e) {}
   };
-  
+
   await tick();
   state.pollTimer = setInterval(tick, 60000);
+}
+
+function updateUserBadge() {
+  const badge = document.getElementById('myTicketsBadge');
+  if (!badge) return;
+  const count = state.updatedTicketIds.size;
+  if (count > 0) {
+    badge.textContent = count > 99 ? '99+' : count;
+    badge.style.display = 'inline-flex';
+  } else {
+    badge.style.display = 'none';
+  }
 }
 
 /* =============================================================
@@ -2163,14 +2245,22 @@ window.addEventListener('DOMContentLoaded', () => {
     return;
   }
   
-  // Try restore session (localStorage — อยู่ได้ 12 ชม. แม้ refresh/ปิด tab)
+  // Try restore session (localStorage + cookie — อยู่ได้ 12 ชม. แม้ refresh/ปิด tab/in-app browser)
   const cachedUser = loadSession();
   if (cachedUser) {
     state.user = cachedUser;
-    loadLoginData().then(() => enterApp());
+    // ซ่อนหน้า login ทันที กันเห็นวูบบนเน็ตมือถือที่ช้า
+    document.getElementById('loginView').style.display = 'none';
+    loadLoginData().then(() => enterApp()).catch(() => {
+      // โหลดข้อมูลพื้นฐานไม่ได้ (เน็ตหลุด) — กลับไปหน้า login
+      document.getElementById('loginView').style.display = 'flex';
+      toast('เชื่อมต่อไม่ได้', 'ตรวจสอบอินเทอร์เน็ตแล้วลองรีเฟรชใหม่', 'error');
+    });
     return;
   }
-  loadLoginData();
+  loadLoginData().catch(() => {
+    toast('เชื่อมต่อล้มเหลว', 'ตรวจสอบอินเทอร์เน็ต หรือ GAS URL', 'error');
+  });
 });
 </script>
 </body>
