@@ -363,6 +363,7 @@ let state = {
   userSeen: {},
   userPrimed: false,
   userReadIds: new Set(),
+  pollNow: null,
   updatedTicketIds: new Set(),
   soundOn: false,
   audioCtx: null,
@@ -381,7 +382,8 @@ async function apiGet(action, params = {}) {
   const url = new URL(GAS_URL);
   url.searchParams.set('action', action);
   Object.keys(params).forEach(k => { if (params[k] != null) url.searchParams.set(k, params[k]); });
-  const res = await fetch(url.toString(), { method: 'GET' });
+  url.searchParams.set('_t', Date.now()); // กัน browser cache ผลลัพธ์เดิม
+  const res = await fetch(url.toString(), { method: 'GET', cache: 'no-store' });
   return await res.json();
 }
 
@@ -969,6 +971,16 @@ function ticketCardHTML(t, highlight = false) {
 function escapeHtml(s) {
   if (s == null) return '';
   return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+// แปลงวันที่ (รองรับทั้ง "9:29" และ "09:29") เป็น timestamp (ms) สำหรับเรียงลำดับ
+function parseDateMs(v) {
+  if (!v) return 0;
+  const s = String(v).trim();
+  const m = s.match(/(\d{4})-(\d{1,2})-(\d{1,2})[ T](\d{1,2}):(\d{1,2}):?(\d{1,2})?/);
+  if (m) return new Date(+m[1], +m[2]-1, +m[3], +m[4], +m[5], +(m[6]||0)).getTime();
+  const t = Date.parse(s);
+  return isNaN(t) ? 0 : t;
 }
 
 function switchTab(tab) {
@@ -2092,7 +2104,7 @@ async function startAdminPoll() {
       // อัปเดตรายการ "ยังไม่อ่าน" = ticket ทั้งหมดที่ยังไม่อยู่ใน readTicketIds
       state.notifTickets = tickets.filter(t => !state.readTicketIds.has(t.ticketId));
       // เรียงใหม่ล่าสุดอยู่บน
-      state.notifTickets.sort((a,b) => String(b.createdAt).localeCompare(String(a.createdAt)));
+      state.notifTickets.sort((a,b) => parseDateMs(b.createdAt) - parseDateMs(a.createdAt));
       updateBellBadge();
       // ไม่ refresh รายการ/dashboard อัตโนมัติ — ให้ Admin รีเฟรชเข้าไปอ่านเอง
     } catch(e) {
@@ -2102,6 +2114,7 @@ async function startAdminPoll() {
 
   await tick();
   state.pollTimer = setInterval(tick, 30000);
+  state.pollNow = tick; // ให้เรียก poll ทันทีได้ (เช่น ตอนกลับมาที่แท็บ)
 }
 
 /* ===== READ-IDS helpers (เก็บใน localStorage) ===== */
@@ -2178,6 +2191,13 @@ document.addEventListener('click', (e) => {
   }
 });
 
+// เมื่อกลับมาที่แท็บ/เปิดหน้าจอมือถือ → poll ทันที (แก้ปัญหา timer ถูกพักตอนอยู่เบื้องหลัง)
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && state.user && typeof state.pollNow === 'function') {
+    state.pollNow();
+  }
+});
+
 async function startUserPoll() {
   // จำสถานะอัปเดตล่าสุดของแต่ละ ticket (ticketId -> updatedAt) เพื่อตรวจว่ามีอัปเดตใหม่ไหม
   state.userSeen = {};
@@ -2216,6 +2236,7 @@ async function startUserPoll() {
 
   await tick();
   state.pollTimer = setInterval(tick, 60000);
+  state.pollNow = tick; // ให้เรียก poll ทันทีได้ (เช่น ตอนกลับมาที่แท็บ)
 }
 
 function updateUserBadge() {
