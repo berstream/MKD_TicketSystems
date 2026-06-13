@@ -285,6 +285,7 @@ input:checked + .slider:before { transform: translateX(20px); }
       <div id="notifList"></div>
     </div>
     <div class="user-info" id="userInfo"></div>
+    <button class="btn-logout" onclick="openChangePasswordModal()" title="เปลี่ยนรหัสผ่าน">🔑</button>
     <button class="btn-logout" onclick="logout()">ออกจากระบบ</button>
   </div>
 </header>
@@ -360,7 +361,9 @@ let state = {
   draftKey: 'mkd2_draft',
   pendingStatus: null,
   pendingAdminNote: null,
-  filters: {}
+  filters: {},
+  idleTimer: null,
+  allPositions: []
 };
 
 /* =============================================================
@@ -503,7 +506,8 @@ async function doLogin() {
       state.user = r.user;
       const dept = state.depts.find(d => d.id === deptId);
       state.user.deptName = dept ? dept.name : '';
-      sessionStorage.setItem('mkd2_user', JSON.stringify(state.user));
+      if (state.user.isAdmin) state.user.adminKey = password;
+      saveSession();
       enterApp();
     } else {
       toast('เข้าสู่ระบบไม่สำเร็จ', 'รหัสผ่านไม่ถูกต้อง', 'error');
@@ -515,15 +519,75 @@ async function doLogin() {
   }
 }
 
-function logout() {
+function logout(silent) {
   if (state.pollTimer) clearInterval(state.pollTimer);
-  sessionStorage.removeItem('mkd2_user');
+  if (state.idleTimer) clearInterval(state.idleTimer);
+  clearSession();
   state.user = null;
   state.pollTimer = null;
+  state.idleTimer = null;
   document.getElementById('loginView').style.display = 'flex';
   document.getElementById('appView').style.display = 'none';
   document.getElementById('topbarRight').style.display = 'none';
   document.getElementById('loginPassword').value = '';
+  if (silent === 'idle') {
+    toast('ออกจากระบบอัตโนมัติ', 'ไม่มีการใช้งานเกิน 30 นาที', 'warning');
+  }
+}
+
+/* ===== SESSION (localStorage + expiry 12 ชม. — refresh แล้วไม่เด้งออก) ===== */
+const SESSION_KEY = 'mkd2_session';
+const SESSION_HOURS = 12;
+
+function saveSession() {
+  const payload = {
+    user: state.user,
+    expires: Date.now() + SESSION_HOURS * 60 * 60 * 1000
+  };
+  localStorage.setItem(SESSION_KEY, JSON.stringify(payload));
+}
+
+function loadSession() {
+  try {
+    const raw = localStorage.getItem(SESSION_KEY);
+    if (!raw) return null;
+    const payload = JSON.parse(raw);
+    if (!payload.expires || Date.now() > payload.expires) {
+      clearSession();
+      return null;
+    }
+    return payload.user;
+  } catch(e) { return null; }
+}
+
+function clearSession() {
+  localStorage.removeItem(SESSION_KEY);
+  sessionStorage.removeItem('mkd2_user'); // ล้างของเก่าด้วย
+}
+
+/* ===== AUTO-LOGOUT เมื่อไม่ใช้งาน 30 นาที ===== */
+const IDLE_LIMIT_MS = 30 * 60 * 1000;
+let lastActivity = Date.now();
+
+function touchActivity() { lastActivity = Date.now(); }
+
+function startIdleWatch() {
+  lastActivity = Date.now();
+  ['click','keydown','mousemove','touchstart','scroll'].forEach(ev =>
+    document.addEventListener(ev, touchActivity, { passive: true })
+  );
+  if (state.idleTimer) clearInterval(state.idleTimer);
+  state.idleTimer = setInterval(() => {
+    if (!state.user) return;
+    const idle = Date.now() - lastActivity;
+    // เตือนล่วงหน้า 2 นาทีก่อนหลุด
+    if (idle > IDLE_LIMIT_MS - 2*60*1000 && idle < IDLE_LIMIT_MS - 2*60*1000 + 60*1000) {
+      toast('⏰ ใกล้หมดเวลา', 'ไม่มีการใช้งาน — จะออกจากระบบใน 2 นาที (ขยับเมาส์เพื่อใช้งานต่อ)', 'warning');
+    }
+    if (idle >= IDLE_LIMIT_MS) {
+      logout('idle');
+    }
+  }, 60000);
 }
 
 async function enterApp() {
@@ -535,6 +599,8 @@ async function enterApp() {
   // Load categories
   const c = await apiGet('getCategories');
   if (c.ok) state.categories = c.categories;
+  
+  startIdleWatch(); // auto-logout 30 นาที
   
   if (state.user.isAdmin) {
     document.getElementById('bellBtn').style.display = 'block';
@@ -815,6 +881,10 @@ function renderMyTickets() {
   
   container.innerHTML = `
     <div class="filter-bar">
+      <div class="form-group" style="flex:2;min-width:200px;">
+        <label>🔍 ค้นหา</label>
+        <input type="text" class="form-control" id="myFilterSearch" placeholder="พิมพ์คำค้น เช่น ชื่อปัญหา, Ticket ID, ผู้แจ้ง..." oninput="renderMyTicketsList()">
+      </div>
       <div class="form-group">
         <label>กรองตามสถานะ</label>
         <select class="form-control" id="myFilterStatus" onchange="renderMyTicketsList()">
@@ -834,11 +904,21 @@ function renderMyTickets() {
   renderMyTicketsList();
 }
 
+function ticketMatchesSearch(t, q) {
+  if (!q) return true;
+  const hay = [t.ticketId, t.title, t.description, t.reporterName, t.category, t.subCategory, t.deptName, t.adminNote]
+    .map(x => String(x || '').toLowerCase()).join(' ');
+  // รองรับหลายคำ คั่นด้วยช่องว่าง — ต้องเจอทุกคำ
+  return q.toLowerCase().split(/\s+/).filter(Boolean).every(word => hay.includes(word));
+}
+
 function renderMyTicketsList() {
   const filter = document.getElementById('myFilterStatus')?.value || '';
+  const q = document.getElementById('myFilterSearch')?.value.trim() || '';
   const list = document.getElementById('myTicketList');
-  const filtered = filter ? state.tickets.filter(t => t.status === filter) : state.tickets;
-  if (filtered.length === 0) { list.innerHTML = '<div class="empty-state"><div class="title">ไม่มีรายการ</div></div>'; return; }
+  let filtered = filter ? state.tickets.filter(t => t.status === filter) : state.tickets;
+  filtered = filtered.filter(t => ticketMatchesSearch(t, q));
+  if (filtered.length === 0) { list.innerHTML = '<div class="empty-state"><div class="title">ไม่มีรายการ' + (q ? 'ที่ตรงกับ "' + escapeHtml(q) + '"' : '') + '</div></div>'; return; }
   list.innerHTML = filtered.map(t => ticketCardHTML(t, state.updatedTicketIds.has(t.ticketId))).join('');
 }
 
@@ -881,6 +961,8 @@ function switchTab(tab) {
   if (tab === 'allTickets') loadAdminTickets();
   if (tab === 'export') loadExportPanel();
   if (tab === 'depts') loadDeptMgmt();
+  if (tab === 'positions') loadPositionMgmt();
+  if (tab === 'categories') loadCategoryMgmt();
   if (tab === 'archive') loadArchive();
 }
 
@@ -894,12 +976,16 @@ function renderAdminApp() {
       <button class="tab" data-tab="allTickets" onclick="switchTab('allTickets')">📋 Tickets</button>
       <button class="tab" data-tab="export" onclick="switchTab('export')">📄 Export PDF</button>
       <button class="tab" data-tab="depts" onclick="switchTab('depts')">🏢 แผนก</button>
+      <button class="tab" data-tab="positions" onclick="switchTab('positions')">👥 ตำแหน่ง & รหัสผ่าน</button>
+      <button class="tab" data-tab="categories" onclick="switchTab('categories')">📂 หมวดหมู่</button>
       <button class="tab" data-tab="archive" onclick="switchTab('archive')">📁 Archive</button>
     </div>
     <div class="tab-content active" id="tab-dashboard"></div>
     <div class="tab-content" id="tab-allTickets"></div>
     <div class="tab-content" id="tab-export"></div>
     <div class="tab-content" id="tab-depts"></div>
+    <div class="tab-content" id="tab-positions"></div>
+    <div class="tab-content" id="tab-categories"></div>
     <div class="tab-content" id="tab-archive"></div>
   `;
   state.currentTab = 'dashboard';
@@ -1114,6 +1200,10 @@ function renderAdminTickets() {
   
   container.innerHTML = `
     <div class="filter-bar">
+      <div class="form-group" style="flex:2;min-width:200px;">
+        <label>🔍 ค้นหา</label>
+        <input type="text" class="form-control" id="atFilterSearch" placeholder="พิมพ์คำค้น เช่น ชื่อปัญหา, Ticket ID, ผู้แจ้ง..." oninput="renderAdminTicketsList()">
+      </div>
       <div class="form-group">
         <label>แผนก</label>
         <select class="form-control" id="atFilterDept" onchange="renderAdminTicketsList()">
@@ -1161,16 +1251,18 @@ function renderAdminTicketsList() {
   const fc = document.getElementById('atFilterCat').value;
   const fs = document.getElementById('atFilterStatus').value;
   const fp = document.getElementById('atFilterPrio').value;
+  const q = document.getElementById('atFilterSearch')?.value.trim() || '';
   
   let list = state.tickets;
   if (fd) list = list.filter(t => t.deptName === fd);
   if (fc) list = list.filter(t => t.category === fc);
   if (fs) list = list.filter(t => t.status === fs);
   if (fp) list = list.filter(t => t.priority === fp);
+  list = list.filter(t => ticketMatchesSearch(t, q));
   
   const container = document.getElementById('adminTicketList');
-  if (list.length === 0) { container.innerHTML = '<div class="empty-state"><div class="title">ไม่มี Ticket ตรงเงื่อนไข</div></div>'; return; }
-  container.innerHTML = list.map(t => ticketCardHTML(t, state.newTicketIds.has(t.ticketId))).join('');
+  if (list.length === 0) { container.innerHTML = '<div class="empty-state"><div class="title">ไม่มี Ticket ตรงเงื่อนไข' + (q ? ' กับคำค้น "' + escapeHtml(q) + '"' : '') + '</div></div>'; return; }
+  container.innerHTML = '<div style="margin-bottom:8px;font-size:13px;color:var(--gray-500);">พบ ' + list.length + ' รายการ</div>' + list.map(t => ticketCardHTML(t, state.newTicketIds.has(t.ticketId))).join('');
 }
 
 /* ===== TICKET DETAIL MODAL ===== */
@@ -1607,6 +1699,327 @@ function exportArchiveCSV() {
 }
 
 /* =============================================================
+   POSITION & PASSWORD MANAGEMENT (Admin)
+   ============================================================= */
+async function loadPositionMgmt() {
+  const container = document.getElementById('tab-positions');
+  container.innerHTML = '<div class="loading-page"><span class="loading"></span> กำลังโหลด...</div>';
+  
+  const r = await apiGet('getAllPositionsAdmin', { adminKey: state.user.adminKey });
+  if (!r.ok) {
+    container.innerHTML = '<div class="empty-state"><div class="icon">⚠️</div><div class="title">' + escapeHtml(r.error || 'โหลดไม่สำเร็จ') + '</div><div style="margin-top:8px;font-size:13px;">ลอง logout แล้ว login ใหม่อีกครั้ง</div></div>';
+    return;
+  }
+  
+  state.allPositions = r.positions;
+  
+  const deptOptions = state.depts.map(d => `<option value="${d.id}">${escapeHtml(d.name)}</option>`).join('');
+  
+  container.innerHTML = `
+    <div class="card" style="margin-bottom:14px;">
+      <div class="card-title">➕ เพิ่มตำแหน่งใหม่</div>
+      <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:end;">
+        <div class="form-group" style="margin-bottom:0;flex:1;min-width:160px;">
+          <label>แผนก</label>
+          <select id="newPosDept" class="form-control">${deptOptions}</select>
+        </div>
+        <div class="form-group" style="margin-bottom:0;flex:1;min-width:180px;">
+          <label>ชื่อตำแหน่ง</label>
+          <input type="text" id="newPosName" class="form-control" placeholder="เช่น Forklift Driver">
+        </div>
+        <div class="form-group" style="margin-bottom:0;min-width:160px;">
+          <label>รหัสผ่าน</label>
+          <div style="display:flex;gap:6px;">
+            <input type="text" id="newPosPassword" class="form-control" placeholder="รหัสผ่าน">
+            <button class="btn btn-secondary" onclick="document.getElementById('newPosPassword').value=genPassword(document.getElementById('newPosName').value)" title="สุ่มรหัส">🎲</button>
+          </div>
+        </div>
+        <button class="btn btn-primary" onclick="addNewPosition()">เพิ่ม</button>
+      </div>
+    </div>
+    
+    <div class="card" style="margin-bottom:14px;">
+      <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;">
+        <div class="card-title" style="margin-bottom:0;">👥 ตำแหน่งทั้งหมด (${r.positions.length})</div>
+        <div style="display:flex;gap:8px;align-items:center;">
+          <input type="text" id="posSearch" class="form-control" placeholder="🔍 ค้นหาตำแหน่ง..." style="width:200px;padding:8px 10px;font-size:13px;" oninput="renderPositionTable()">
+          <button class="btn btn-secondary" onclick="togglePasswordVisibility()" id="pwVisBtn">👁️ แสดงรหัสผ่าน</button>
+        </div>
+      </div>
+    </div>
+    <div id="positionTableWrap"></div>
+  `;
+  
+  state.showPasswords = false;
+  renderPositionTable();
+}
+
+function renderPositionTable() {
+  const q = (document.getElementById('posSearch')?.value || '').trim().toLowerCase();
+  let list = state.allPositions;
+  if (q) {
+    list = list.filter(p => (p.name + ' ' + p.deptName).toLowerCase().includes(q));
+  }
+  
+  const show = state.showPasswords;
+  document.getElementById('positionTableWrap').innerHTML = `
+    <div class="dept-table">
+      <table>
+        <thead>
+          <tr><th>ID</th><th>แผนก</th><th>ตำแหน่ง</th><th>รหัสผ่าน</th><th>สถานะ</th><th>การกระทำ</th></tr>
+        </thead>
+        <tbody>
+          ${list.map(p => `
+            <tr style="${!p.active ? 'opacity:0.5;background:var(--gray-50);' : ''}">
+              <td><code>${p.id}</code></td>
+              <td>${escapeHtml(p.deptName)}</td>
+              <td><strong>${escapeHtml(p.name)}</strong>${p.name === 'Admin IT' ? ' 🛡️' : ''}</td>
+              <td>
+                <code style="background:var(--gray-100);padding:4px 8px;border-radius:6px;font-size:13px;">${show ? escapeHtml(p.password) : '••••••••'}</code>
+                <button class="btn btn-secondary" style="padding:4px 8px;font-size:11px;" onclick="copyPassword('${p.id}')" title="คัดลอก">📋</button>
+              </td>
+              <td>${p.active ? '<span style="color:var(--success);font-weight:600;">✓ ใช้งาน</span>' : '<span style="color:var(--gray-400);">ปิด</span>'}</td>
+              <td style="white-space:nowrap;">
+                <button class="btn btn-warning" style="padding:6px 10px;font-size:12px;" onclick="resetPositionPassword('${p.id}')">🔑 Reset</button>
+                ${p.name !== 'Admin IT' ? `<button class="btn btn-secondary" style="padding:6px 10px;font-size:12px;" onclick="togglePosition('${p.id}')">${p.active ? '⏸ ปิด' : '▶ เปิด'}</button>` : ''}
+              </td>
+            </tr>
+          `).join('')}
+        </tbody>
+      </table>
+    </div>
+  `;
+}
+
+function togglePasswordVisibility() {
+  state.showPasswords = !state.showPasswords;
+  document.getElementById('pwVisBtn').textContent = state.showPasswords ? '🙈 ซ่อนรหัสผ่าน' : '👁️ แสดงรหัสผ่าน';
+  renderPositionTable();
+}
+
+function copyPassword(positionId) {
+  const p = state.allPositions.find(x => x.id === positionId);
+  if (!p) return;
+  navigator.clipboard.writeText(p.password).then(() => {
+    toast('คัดลอกแล้ว', `รหัสผ่านของ ${p.name}`, 'success');
+  }).catch(() => {
+    prompt('คัดลอกรหัสผ่าน:', p.password);
+  });
+}
+
+function genPassword(nameHint) {
+  // สร้างรหัสแบบเดียวกับ scheme เดิม: ตัวย่อ + เลข 4 หลัก
+  let prefix = 'Px';
+  if (nameHint && nameHint.trim()) {
+    const words = nameHint.trim().split(/\s+/);
+    prefix = words.map(w => w[0]).join('').substring(0, 3);
+    prefix = prefix.charAt(0).toUpperCase() + prefix.slice(1).toLowerCase();
+  }
+  const num = Math.floor(1000 + Math.random() * 9000);
+  return prefix + num;
+}
+
+async function addNewPosition() {
+  const deptId = document.getElementById('newPosDept').value;
+  const name = document.getElementById('newPosName').value.trim();
+  let password = document.getElementById('newPosPassword').value.trim();
+  
+  if (!name) { toast('กรอกชื่อตำแหน่ง', '', 'warning'); return; }
+  if (!password) password = genPassword(name);
+  
+  const r = await apiPost('managePosition', {
+    adminKey: state.user.adminKey,
+    subAction: 'add', deptId, name, password
+  });
+  
+  if (r.ok) {
+    toast('เพิ่มตำแหน่งแล้ว', `${name} — รหัสผ่าน: ${password}`, 'success');
+    document.getElementById('newPosName').value = '';
+    document.getElementById('newPosPassword').value = '';
+    loadPositionMgmt();
+  } else {
+    toast('ไม่สำเร็จ', r.error, 'error');
+  }
+}
+
+async function togglePosition(positionId) {
+  const p = state.allPositions.find(x => x.id === positionId);
+  if (!p) return;
+  if (!confirm(`${p.active ? 'ปิด' : 'เปิด'}ใช้งานตำแหน่ง "${p.name}"?`)) return;
+  
+  const r = await apiPost('managePosition', {
+    adminKey: state.user.adminKey,
+    subAction: 'toggle', positionId
+  });
+  
+  if (r.ok) { toast('อัปเดตแล้ว', '', 'success'); loadPositionMgmt(); }
+  else toast('ไม่สำเร็จ', r.error, 'error');
+}
+
+async function resetPositionPassword(positionId) {
+  const p = state.allPositions.find(x => x.id === positionId);
+  if (!p) return;
+  
+  const suggested = genPassword(p.name);
+  const newPassword = prompt(`Reset รหัสผ่านของ "${p.name}"\nกรอกรหัสใหม่ (หรือใช้ที่สุ่มให้):`, suggested);
+  if (newPassword === null) return; // กดยกเลิก
+  if (!newPassword || newPassword.length < 4) { toast('รหัสสั้นไป', 'ต้องอย่างน้อย 4 ตัวอักษร', 'warning'); return; }
+  
+  const r = await apiPost('adminResetPassword', {
+    adminKey: state.user.adminKey,
+    positionId, newPassword
+  });
+  
+  if (r.ok) {
+    toast('Reset สำเร็จ', `${p.name} → รหัสใหม่: ${newPassword}`, 'success');
+    loadPositionMgmt();
+  } else {
+    toast('ไม่สำเร็จ', r.error, 'error');
+  }
+}
+
+/* =============================================================
+   CATEGORY MANAGEMENT (Admin)
+   ============================================================= */
+async function loadCategoryMgmt() {
+  const container = document.getElementById('tab-categories');
+  container.innerHTML = '<div class="loading-page"><span class="loading"></span> กำลังโหลด...</div>';
+  
+  const r = await apiGet('getCategories');
+  if (!r.ok) { container.innerHTML = '<div class="empty-state"><div class="title">โหลดไม่สำเร็จ</div></div>'; return; }
+  
+  state.categories = r.categories;
+  const mains = [...new Set(r.categories.map(c => c.main))];
+  
+  container.innerHTML = `
+    <div class="card" style="margin-bottom:14px;">
+      <div class="card-title">➕ เพิ่มหมวดหมู่ใหม่</div>
+      <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:end;">
+        <div class="form-group" style="margin-bottom:0;flex:1;min-width:180px;">
+          <label>หมวดหมู่หลัก</label>
+          <input type="text" id="newCatMain" class="form-control" list="mainCatList" placeholder="เลือกที่มีอยู่ หรือพิมพ์ใหม่">
+          <datalist id="mainCatList">${mains.map(m => `<option value="${escapeHtml(m)}">`).join('')}</datalist>
+        </div>
+        <div class="form-group" style="margin-bottom:0;flex:1;min-width:180px;">
+          <label>หมวดหมู่ย่อย</label>
+          <input type="text" id="newCatSub" class="form-control" placeholder="เช่น Scanner, UPS">
+        </div>
+        <button class="btn btn-primary" onclick="addNewCategory()">เพิ่ม</button>
+      </div>
+      <div style="margin-top:10px;font-size:12px;color:var(--gray-500);">💡 พิมพ์หมวดหมู่หลักใหม่เพื่อสร้างกลุ่มใหม่ หรือเลือกจากที่มีเพื่อเพิ่มหมวดย่อยเข้าไป</div>
+    </div>
+    
+    ${mains.map(main => {
+      const subs = r.categories.filter(c => c.main === main);
+      return `
+        <div class="card" style="margin-bottom:12px;">
+          <div class="card-title">📂 ${escapeHtml(main)} <span style="font-weight:400;color:var(--gray-500);font-size:13px;">(${subs.length} หมวดย่อย)</span></div>
+          <div style="display:flex;flex-wrap:wrap;gap:8px;">
+            ${subs.map(c => `
+              <div style="display:flex;align-items:center;gap:6px;background:var(--gray-100);padding:6px 10px;border-radius:8px;font-size:13px;">
+                <span>${escapeHtml(c.sub)}</span>
+                <button onclick="deleteCategory('${c.id}', '${escapeHtml(c.main)}', '${escapeHtml(c.sub)}')" style="background:none;border:none;cursor:pointer;color:var(--danger);font-size:14px;padding:0;" title="ลบ">✕</button>
+              </div>
+            `).join('')}
+          </div>
+        </div>
+      `;
+    }).join('')}
+  `;
+}
+
+async function addNewCategory() {
+  const main = document.getElementById('newCatMain').value.trim();
+  const sub = document.getElementById('newCatSub').value.trim();
+  
+  if (!main || !sub) { toast('กรอกให้ครบ', 'ต้องมีทั้งหมวดหลักและหมวดย่อย', 'warning'); return; }
+  
+  const r = await apiPost('manageCategory', {
+    adminKey: state.user.adminKey,
+    subAction: 'add', main, sub
+  });
+  
+  if (r.ok) {
+    toast('เพิ่มหมวดหมู่แล้ว', `${main} → ${sub}`, 'success');
+    document.getElementById('newCatSub').value = '';
+    loadCategoryMgmt();
+  } else {
+    toast('ไม่สำเร็จ', r.error, 'error');
+  }
+}
+
+async function deleteCategory(categoryId, main, sub) {
+  if (!confirm(`ลบหมวดหมู่ "${main} → ${sub}"?\n\n(Ticket เดิมที่ใช้หมวดนี้จะยังอยู่ ไม่ถูกลบ)`)) return;
+  
+  const r = await apiPost('manageCategory', {
+    adminKey: state.user.adminKey,
+    subAction: 'delete', categoryId
+  });
+  
+  if (r.ok) { toast('ลบแล้ว', '', 'success'); loadCategoryMgmt(); }
+  else toast('ไม่สำเร็จ', r.error, 'error');
+}
+
+/* =============================================================
+   CHANGE OWN PASSWORD (ทุกคน)
+   ============================================================= */
+function openChangePasswordModal() {
+  state.currentTicket = null; // ป้องกัน unsaved-check ของ ticket modal
+  document.getElementById('modalTitle').textContent = '🔑 เปลี่ยนรหัสผ่าน';
+  document.getElementById('modalBody').innerHTML = `
+    <div style="margin-bottom:14px;color:var(--gray-600);font-size:13px;">
+      ตำแหน่ง: <strong>${escapeHtml(state.user.position)}</strong> • แผนก: <strong>${escapeHtml(state.user.deptName)}</strong>
+    </div>
+    <div class="form-group">
+      <label>รหัสผ่านเดิม <span class="req">*</span></label>
+      <input type="password" id="cpOld" class="form-control" placeholder="••••••••">
+    </div>
+    <div class="form-group">
+      <label>รหัสผ่านใหม่ <span class="req">*</span> <span style="font-weight:400;color:var(--gray-500);">(อย่างน้อย 4 ตัวอักษร)</span></label>
+      <input type="text" id="cpNew" class="form-control" placeholder="รหัสผ่านใหม่">
+    </div>
+    <div class="form-group">
+      <label>ยืนยันรหัสผ่านใหม่ <span class="req">*</span></label>
+      <input type="text" id="cpConfirm" class="form-control" placeholder="พิมพ์รหัสใหม่อีกครั้ง">
+    </div>
+  `;
+  document.getElementById('modalFooter').innerHTML = `
+    <button class="btn btn-secondary" onclick="document.getElementById('ticketModal').classList.remove('show')">ยกเลิก</button>
+    <button class="btn btn-primary" onclick="submitChangePassword()">💾 เปลี่ยนรหัสผ่าน</button>
+  `;
+  document.getElementById('ticketModal').classList.add('show');
+}
+
+async function submitChangePassword() {
+  const oldPw = document.getElementById('cpOld').value;
+  const newPw = document.getElementById('cpNew').value;
+  const confirmPw = document.getElementById('cpConfirm').value;
+  
+  if (!oldPw || !newPw || !confirmPw) { toast('กรอกให้ครบ', '', 'warning'); return; }
+  if (newPw.length < 4) { toast('รหัสสั้นไป', 'ต้องอย่างน้อย 4 ตัวอักษร', 'warning'); return; }
+  if (newPw !== confirmPw) { toast('รหัสไม่ตรงกัน', 'ยืนยันรหัสผ่านใหม่ให้ตรงกัน', 'warning'); return; }
+  
+  const r = await apiPost('changePassword', {
+    deptId: state.user.deptId,
+    position: state.user.position,
+    oldPassword: oldPw,
+    newPassword: newPw
+  });
+  
+  if (r.ok) {
+    toast('เปลี่ยนรหัสผ่านสำเร็จ', 'ใช้รหัสใหม่ในการ login ครั้งถัดไป', 'success');
+    // ถ้าเป็น admin ต้องอัปเดต adminKey ด้วย
+    if (state.user.isAdmin) {
+      state.user.adminKey = newPw;
+      saveSession();
+    }
+    document.getElementById('ticketModal').classList.remove('show');
+  } else {
+    toast('ไม่สำเร็จ', r.error, 'error');
+  }
+}
+
+/* =============================================================
    POLLING & NOTIFICATIONS
    ============================================================= */
 async function startAdminPoll() {
@@ -1750,14 +2163,12 @@ window.addEventListener('DOMContentLoaded', () => {
     return;
   }
   
-  // Try restore session
-  const cached = sessionStorage.getItem('mkd2_user');
-  if (cached) {
-    try {
-      state.user = JSON.parse(cached);
-      loadLoginData().then(() => enterApp());
-      return;
-    } catch(e) {}
+  // Try restore session (localStorage — อยู่ได้ 12 ชม. แม้ refresh/ปิด tab)
+  const cachedUser = loadSession();
+  if (cachedUser) {
+    state.user = cachedUser;
+    loadLoginData().then(() => enterApp());
+    return;
   }
   loadLoginData();
 });
