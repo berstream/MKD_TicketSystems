@@ -1818,6 +1818,23 @@ async function loadSuperSites() {
         <input type="text" id="spSiteName" class="form-control" placeholder="เช่น Bangkok DC"></div>
       <div class="form-group"><label>ชื่อ IT Admin <span style="font-weight:400;color:var(--gray-500);">(เว้นว่าง = IT [ID] ADMIN)</span></label>
         <input type="text" id="spAdminName" class="form-control" placeholder="เช่น IT BKK ADMIN"></div>
+      <div class="form-group">
+        <label>📋 Copy โครงสร้างจาก Site อื่น <span style="font-weight:400;color:var(--gray-500);">(ไม่บังคับ)</span></label>
+        <select id="spCopyFrom" class="form-control" onchange="onCopyFromChange()">
+          <option value="">— ไม่ copy (เริ่มจากค่ามาตรฐาน) —</option>
+          ${(r.ok ? r.sites : []).map(s => `<option value="${escapeHtml(s.id)}">${escapeHtml(s.id)} — ${escapeHtml(s.name)}</option>`).join('')}
+        </select>
+        <div id="copyOptions" style="display:none;margin-top:10px;padding:12px;background:var(--gray-50);border-radius:8px;">
+          <div style="font-size:12px;color:var(--gray-600);margin-bottom:8px;">เลือกสิ่งที่จะ copy มา:</div>
+          <label style="display:flex;align-items:center;gap:8px;font-size:13px;margin-bottom:6px;cursor:pointer;">
+            <input type="checkbox" id="spCopyDepts" checked style="width:16px;height:16px;accent-color:var(--primary);"> 🏢 แผนก</label>
+          <label style="display:flex;align-items:center;gap:8px;font-size:13px;margin-bottom:6px;cursor:pointer;">
+            <input type="checkbox" id="spCopyCats" checked style="width:16px;height:16px;accent-color:var(--primary);"> 📂 หมวดหมู่ (+ Auto-Archive)</label>
+          <label style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer;">
+            <input type="checkbox" id="spCopyBUs" checked style="width:16px;height:16px;accent-color:var(--primary);"> 🏷️ BU</label>
+          <div style="font-size:11px;color:var(--gray-500);margin-top:8px;">💡 ตำแหน่ง & รหัสผ่านไม่ถูก copy (แต่ละคนตั้งเอง) — แผนก Support + IT Admin สร้างให้เสมอ</div>
+        </div>
+      </div>
       <button class="btn btn-primary btn-block" id="runSiteBtn" onclick="runCreateSite()">🚀 Run Site</button>
       <div id="createSiteResult"></div>
     </div>
@@ -1827,19 +1844,28 @@ async function loadSuperSites() {
     </div>`;
 }
 
+function onCopyFromChange() {
+  const val = document.getElementById('spCopyFrom').value;
+  document.getElementById('copyOptions').style.display = val ? 'block' : 'none';
+}
+
 async function runCreateSite() {
   const siteId = document.getElementById('spSiteId').value.trim().toUpperCase();
   const siteName = document.getElementById('spSiteName').value.trim();
   const adminName = document.getElementById('spAdminName').value.trim();
   if (!siteId || !siteName) { toast('กรอก Site ID และชื่อให้ครบ', '', 'warning'); return; }
+  const copyFrom = document.getElementById('spCopyFrom').value;
+  const copyDepts = copyFrom && document.getElementById('spCopyDepts').checked;
+  const copyCats = copyFrom && document.getElementById('spCopyCats').checked;
+  const copyBUs = copyFrom && document.getElementById('spCopyBUs').checked;
   const btn = document.getElementById('runSiteBtn');
   btn.disabled = true; btn.innerHTML = '<span class="loading"></span> กำลังสร้าง Site... (อาจใช้เวลาสักครู่)';
   try {
-    const r = await apiPost('createSite', { superKey: state.superKey, siteId, siteName, adminName });
+    const r = await apiPost('createSite', { superKey: state.superKey, siteId, siteName, adminName, copyFrom, copyDepts, copyCats, copyBUs });
     if (r.ok) {
       document.getElementById('createSiteResult').innerHTML = `
         <div style="margin-top:14px;padding:16px;background:#d1fae5;border:1px solid var(--success);border-radius:10px;">
-          <div style="font-weight:700;color:#065f46;margin-bottom:10px;">✅ สร้าง Site "${escapeHtml(r.siteName)}" สำเร็จ!</div>
+          <div style="font-weight:700;color:#065f46;margin-bottom:10px;">✅ สร้าง Site "${escapeHtml(r.siteName)}" สำเร็จ!${r.copyNote ? '<div style="font-size:12px;font-weight:400;margin-top:4px;">Copy:' + escapeHtml(r.copyNote) + '</div>' : ''}</div>
           <div class="detail-row"><div class="label">IT Admin</div><div class="value"><strong>${escapeHtml(r.adminName)}</strong></div></div>
           <div class="detail-row"><div class="label">รหัสผ่าน</div><div class="value"><code style="font-size:15px;background:#fff;padding:4px 10px;">${escapeHtml(r.password)}</code> <button class="btn btn-secondary btn-sm" onclick="navigator.clipboard.writeText('${escapeHtml(r.password)}');toast('คัดลอกแล้ว','','success')">📋</button></div></div>
           <div class="detail-row"><div class="label">Google Sheet</div><div class="value"><a href="${r.sheetUrl}" target="_blank">🔗 เปิด Sheet ของ Site นี้</a></div></div>
@@ -1848,6 +1874,8 @@ async function runCreateSite() {
       document.getElementById('spSiteId').value = '';
       document.getElementById('spSiteName').value = '';
       document.getElementById('spAdminName').value = '';
+      document.getElementById('spCopyFrom').value = '';
+      document.getElementById('copyOptions').style.display = 'none';
       toast('สร้าง Site สำเร็จ', r.siteName, 'success');
     } else toast('สร้างไม่สำเร็จ', r.error, 'error');
   } catch(e) { toast('เกิดข้อผิดพลาด', e.message, 'error'); }
