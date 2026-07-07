@@ -360,7 +360,8 @@ let state = {
   selectedTickets: new Set(),
   dashSites: new Set(), filters: {},
   allPositions: [], showPasswords: false,
-  pendingStatus: null, selSiteId: null, archiveTickets: []
+  pendingStatus: null, selSiteId: null, archiveTickets: [],
+  adminPage: 1, myPage: 1
 };
 
 /* ═══════ API ═══════ */
@@ -620,6 +621,54 @@ function logout(silent) {
   if (silent === 'idle') toast('ออกจากระบบอัตโนมัติ', 'ไม่มีการใช้งานเกิน 30 นาที', 'warning');
 }
 
+/* ═══════ MASTER DATA CACHE (ไม่แตะ login — ใช้หลัง login แล้วเท่านั้น) ═══════
+   cache แผนก/ตำแหน่ง/BU/หมวดหมู่ ใน localStorage เพื่อให้เปิดแอปไว
+   - โหลดจาก cache ทันที (ถ้ามี) แล้วดึงสดมาอัปเดตเบื้องหลัง
+   - invalidate ทันทีเมื่อ IT Admin แก้ไข master data
+   หมายเหตุ: login ไม่ใช้ cache นี้เลย — ดึงสดเสมอ */
+const CACHE_TTL_MS = 6 * 3600000; // 6 ชม.
+function cacheKey(siteId, type) { return 'tk_cache_' + type + '_' + siteId; }
+function readCache(siteId, type) {
+  try {
+    const raw = localStorage.getItem(cacheKey(siteId, type));
+    if (!raw) return null;
+    const obj = JSON.parse(raw);
+    if (!obj.t || Date.now() - obj.t > CACHE_TTL_MS) return null;
+    return obj.d;
+  } catch(e) { return null; }
+}
+function writeCache(siteId, type, data) {
+  try { localStorage.setItem(cacheKey(siteId, type), JSON.stringify({ t: Date.now(), d: data })); } catch(e) {}
+}
+function invalidateCache(siteId, type) {
+  try { localStorage.removeItem(cacheKey(siteId, type)); } catch(e) {}
+}
+/** โหลด master data: ใช้ cache ก่อน (เร็ว) + ดึงสดมาอัปเดตเบื้องหลัง */
+async function loadMasterData(siteId, opts) {
+  opts = opts || {};
+  // 1) ลอง cache ก่อน — เปิดแอปไวทันที
+  const cCat = readCache(siteId, 'cat');
+  const cBU = readCache(siteId, 'bu');
+  if (cCat) state.categories = cCat;
+  if (cBU) state.bus = cBU;
+  const hadCache = cCat && cBU;
+
+  // 2) ดึงสด (ถ้าไม่มี cache = รอ, ถ้ามี cache = เบื้องหลัง)
+  const fetchFresh = async () => {
+    try {
+      const [c, b] = await Promise.all([
+        apiGet('getCategories', { siteId }),
+        apiGet('getBUs', { siteId })
+      ]);
+      if (c.ok) { state.categories = c.categories; writeCache(siteId, 'cat', c.categories); }
+      if (b.ok) { state.bus = b.bus; writeCache(siteId, 'bu', b.bus); }
+      if (hadCache && opts.onRefresh) opts.onRefresh();
+    } catch(e) {}
+  };
+  if (hadCache) { fetchFresh(); } // เบื้องหลัง ไม่รอ
+  else { await fetchFresh(); }     // ครั้งแรก ต้องรอ
+}
+
 /* ═══════ ENTER APP ═══════ */
 async function enterApp() {
   showView('appView');
@@ -628,12 +677,10 @@ async function enterApp() {
   document.getElementById('siteBadge').textContent = state.user.siteId;
   document.getElementById('appTitle').textContent = 'Ticket System';
   document.getElementById('userInfo').textContent = state.user.position + ' • ' + state.user.siteName;
-  const [c, b] = await Promise.all([
-    apiGet('getCategories', { siteId: state.user.siteId }),
-    apiGet('getBUs', { siteId: state.user.siteId })
-  ]);
-  if (c.ok) state.categories = c.categories;
-  if (b.ok) state.bus = b.bus;
+  // โหลด master data (มี cache — เปิดไว)
+  await loadMasterData(state.user.siteId, {
+    onRefresh: () => { if (state.currentTab === 'submit') { const el = document.getElementById('tab-submit'); if (el) el.innerHTML = renderSubmitForm(); setupDraftAutoSave(); } }
+  });
   startIdleWatch();
   if (state.user.isAdmin) {
     document.getElementById('bellBtn').style.display = 'block';
@@ -879,7 +926,9 @@ function renderMyTickets() {
       <div class="form-group"><label>&nbsp;</label>
         <button class="btn btn-secondary" onclick="loadMyTickets()">🔄</button></div>
     </div>
-    <div class="ticket-list" id="myTicketList"></div>`;
+    <div class="ticket-list" id="myTicketList"></div>
+    <div id="myPager" style="text-align:center;margin-top:12px;"></div>`;
+  state.myPage = 1;
   renderMyTicketsList();
 }
 
@@ -890,15 +939,24 @@ function ticketMatchesSearch(t, q) {
   return q.toLowerCase().split(/\s+/).filter(Boolean).every(w => hay.includes(w));
 }
 
+const MY_PAGE_SIZE = 50;
 function renderMyTicketsList() {
   const f = document.getElementById('myFilterStatus')?.value || '';
   const q = document.getElementById('myFilterSearch')?.value.trim() || '';
   const list = document.getElementById('myTicketList');
+  const pager = document.getElementById('myPager');
   let filtered = f ? state.tickets.filter(t => t.status === f) : state.tickets;
   filtered = filtered.filter(t => ticketMatchesSearch(t, q));
-  if (!filtered.length) { list.innerHTML = '<div class="empty-state"><div class="title">ไม่มีรายการ</div></div>'; return; }
-  list.innerHTML = filtered.map(t => ticketCardHTML(t, { highlight: state.updatedTicketIds.has(t.ticketId) })).join('');
+  if (!filtered.length) { list.innerHTML = '<div class="empty-state"><div class="title">ไม่มีรายการ</div></div>'; if (pager) pager.innerHTML = ''; return; }
+  const page = state.myPage || 1;
+  const shown = filtered.slice(0, page * MY_PAGE_SIZE);
+  list.innerHTML = shown.map(t => ticketCardHTML(t, { highlight: state.updatedTicketIds.has(t.ticketId) })).join('');
+  if (pager) {
+    if (shown.length < filtered.length) pager.innerHTML = `<button class="btn btn-secondary" onclick="loadMoreMy()">โหลดเพิ่ม (${shown.length}/${filtered.length})</button>`;
+    else pager.innerHTML = '';
+  }
 }
+function loadMoreMy() { state.myPage = (state.myPage || 1) + 1; renderMyTicketsList(); }
 
 function ticketCardHTML(t, opt = {}) {
   const icons = { pending:'⏳', inProgress:'🔧', resolved:'✅' };
@@ -912,6 +970,7 @@ function ticketCardHTML(t, opt = {}) {
         <div class="ticket-title">${escapeHtml(t.title)}
           ${cc > 0 ? `<span class="comment-badge">💬 ${cc}</span>` : ''}
           ${age ? `<span class="age-badge ${age.cls}">${age.label}</span>` : ''}
+          ${t.status === 'resolved' && t.resolveDurationHrs !== '' && t.resolveDurationHrs != null ? `<span class="age-badge" style="background:#d1fae5;color:#065f46;">✓ ${fmtDuration(t.resolveDurationHrs)}</span>` : ''}
           ${t.rating ? `<span style="font-size:11px;color:#f59e0b;">⭐${t.rating}</span>` : ''}
         </div>
         <div class="ticket-meta">
@@ -925,6 +984,15 @@ function ticketCardHTML(t, opt = {}) {
       </div>
       <span class="status-badge status-${t.status}">${statusText(t.status)}</span>
     </div>`;
+}
+
+function fmtDuration(hrs) {
+  const h = parseFloat(hrs);
+  if (isNaN(h)) return '';
+  if (h < 1) return Math.round(h * 60) + ' นาที';
+  if (h < 24) return h + ' ชม.';
+  const d = Math.floor(h / 24), rem = Math.round(h % 24);
+  return d + ' วัน' + (rem > 0 ? ' ' + rem + ' ชม.' : '');
 }
 
 function switchTab(tab) {
@@ -960,6 +1028,32 @@ async function openTicketDetail(ticketId, siteId) {
   renderTicketModal();
   document.getElementById('ticketModal').classList.add('show');
   loadComments();
+  loadTimeline();
+}
+
+async function loadTimeline() {
+  const t = state.currentTicket;
+  const box = document.getElementById('timelineBox');
+  if (!box) return;
+  try {
+    const r = await apiGet('getStatusHistory', { siteId: t._siteId, ticketId: t.ticketId });
+    const steps = [];
+    steps.push({ icon:'📝', label:'แจ้งปัญหา', at: t.createdAt, by: t.reporterName });
+    if (r.ok && r.history.length) {
+      r.history.forEach(h => {
+        const icon = h.to === 'inProgress' ? '🔧' : h.to === 'resolved' ? '✅' : '⏳';
+        steps.push({ icon, label: statusText(h.to), at: h.at, by: h.by });
+      });
+    }
+    box.innerHTML = steps.map((s, i) => `
+      <div style="display:flex;gap:8px;align-items:flex-start;${i < steps.length-1 ? 'padding-bottom:8px;' : ''}">
+        <span style="font-size:14px;">${s.icon}</span>
+        <div style="flex:1;">
+          <div style="font-size:12px;font-weight:600;">${escapeHtml(s.label)}</div>
+          <div style="font-size:10px;color:var(--gray-500);">${escapeHtml(String(s.at))} ${s.by ? '• ' + escapeHtml(s.by) : ''}</div>
+        </div>
+      </div>`).join('');
+  } catch(e) { box.innerHTML = '<span style="color:var(--gray-400);font-size:12px;">โหลดไทม์ไลน์ไม่สำเร็จ</span>'; }
 }
 
 function renderTicketModal() {
@@ -978,8 +1072,11 @@ function renderTicketModal() {
     ${t.phone ? `<div class="detail-row"><div class="label">เบอร์โทร</div><div class="value">📞 <a href="tel:${escapeHtml(t.phone)}">${escapeHtml(t.phone)}</a></div></div>` : ''}
     ${t.assignedTo ? `<div class="detail-row"><div class="label">ผู้รับผิดชอบ</div><div class="value">👨‍💻 ${escapeHtml(t.assignedTo)}</div></div>` : ''}
     <div class="detail-row"><div class="label">เวลาแจ้ง</div><div class="value">${escapeHtml(String(t.createdAt))}</div></div>
+    ${t.startedAt ? `<div class="detail-row"><div class="label">เริ่มดำเนินการ</div><div class="value">${escapeHtml(String(t.startedAt))}</div></div>` : ''}
+    ${t.resolvedAt ? `<div class="detail-row"><div class="label">ปิดงาน</div><div class="value">${escapeHtml(String(t.resolvedAt))} ${t.resolveDurationHrs !== '' && t.resolveDurationHrs != null ? `<span style="color:#065f46;font-weight:600;">(ใช้เวลา ${fmtDuration(t.resolveDurationHrs)})</span>` : ''}</div></div>` : ''}
     <div class="detail-row"><div class="label">อัปเดตล่าสุด</div><div class="value">${escapeHtml(String(t.updatedAt))}</div></div>
     <div class="detail-row"><div class="label">รายละเอียด</div><div class="value" style="white-space:pre-wrap;">${escapeHtml(t.description)}</div></div>
+    <div class="detail-row"><div class="label">ไทม์ไลน์</div><div class="value" id="timelineBox"><span style="color:var(--gray-400);font-size:12px;">กำลังโหลด...</span></div></div>
     ${t.imageUrl ? `<div class="detail-row"><div class="label">รูปภาพ</div><div class="value"><a href="${t.imageUrl}" target="_blank"><img src="${t.imageUrl}" style="max-width:100%;max-height:280px;border-radius:8px;" onerror="this.outerHTML='<a href=&quot;${t.imageUrl}&quot; target=&quot;_blank&quot;>🔗 เปิดรูปภาพ</a>'"></a></div></div>` : ''}
     ${isAdmin ? `
       <div class="detail-row"><div class="label">เปลี่ยนสถานะ</div><div class="value">
@@ -1034,12 +1131,55 @@ async function loadComments() {
   if (!r.ok) { el.innerHTML = '<div class="notif-empty">โหลดไม่สำเร็จ</div>'; return; }
   state.currentComments = r.comments;
   if (!r.comments.length) { el.innerHTML = '<div class="notif-empty">ยังไม่มีข้อความ — เริ่มสนทนาได้เลย</div>'; return; }
-  el.innerHTML = r.comments.map(c => `
-    <div class="comment-item ${c.role === 'admin' ? 'admin' : ''}">
+  const myName = state.user.isAdmin ? state.user.position : (t.reporterName || state.user.position);
+  el.innerHTML = r.comments.map(c => {
+    const isMine = String(c.by) === String(myName);
+    const canDelete = isMine || state.user.isAdmin;
+    return `
+    <div class="comment-item ${c.role === 'admin' ? 'admin' : ''}" data-cid="${c.id}">
       <div class="comment-bubble">${escapeHtml(c.message)}</div>
-      <div class="comment-meta">${c.role === 'admin' ? '🛠️' : '👤'} ${escapeHtml(c.by)} • ${escapeHtml(c.createdAt)}</div>
-    </div>`).join('');
+      <div class="comment-meta">${c.role === 'admin' ? '🛠️' : '👤'} ${escapeHtml(c.by)} • ${escapeHtml(c.createdAt)}${c.editedAt ? ' • แก้ไขแล้ว' : ''}
+        ${isMine ? `<button onclick="startEditComment('${c.id}')" style="background:none;border:none;color:var(--primary);cursor:pointer;font-size:10px;padding:0 4px;">แก้</button>` : ''}
+        ${canDelete ? `<button onclick="doDeleteComment('${c.id}')" style="background:none;border:none;color:var(--danger);cursor:pointer;font-size:10px;padding:0;">ลบ</button>` : ''}
+      </div>
+    </div>`;
+  }).join('');
   el.scrollTop = el.scrollHeight;
+}
+
+function startEditComment(cid) {
+  const c = state.currentComments.find(x => x.id === cid);
+  if (!c) return;
+  const item = document.querySelector(`.comment-item[data-cid="${cid}"]`);
+  if (!item) return;
+  const bubble = item.querySelector('.comment-bubble');
+  bubble.innerHTML = `<div style="display:flex;gap:6px;align-items:center;">
+    <input type="text" class="form-control" id="editCmt_${cid}" value="${escapeHtml(c.message)}" style="font-size:13px;padding:6px 8px;">
+    <button class="btn btn-primary btn-sm" onclick="saveEditComment('${cid}')">✓</button>
+    <button class="btn btn-secondary btn-sm" onclick="loadComments()">✕</button>
+  </div>`;
+  const inp = document.getElementById('editCmt_' + cid);
+  inp.focus();
+  inp.onkeydown = (e) => { if (e.key === 'Enter') saveEditComment(cid); };
+}
+
+async function saveEditComment(cid) {
+  const val = document.getElementById('editCmt_' + cid).value.trim();
+  if (!val) return;
+  const t = state.currentTicket;
+  const myName = state.user.isAdmin ? state.user.position : (t.reporterName || state.user.position);
+  const r = await apiPost('editComment', { siteId: t._siteId, commentId: cid, message: val, by: myName });
+  if (r.ok) loadComments();
+  else toast('แก้ไขไม่สำเร็จ', r.error, 'error');
+}
+
+async function doDeleteComment(cid) {
+  if (!confirm('ลบข้อความนี้?')) return;
+  const t = state.currentTicket;
+  const myName = state.user.isAdmin ? state.user.position : (t.reporterName || state.user.position);
+  const r = await apiPost('deleteComment', { siteId: t._siteId, commentId: cid, by: myName, adminKey: state.user.isAdmin ? state.user.adminKey : '' });
+  if (r.ok) loadComments();
+  else toast('ลบไม่สำเร็จ', r.error, 'error');
 }
 
 async function sendComment() {
@@ -1107,7 +1247,7 @@ function renderAdminApp() {
   document.getElementById('mainContent').innerHTML = `
     <div class="tabs">
       <button class="tab active" data-tab="dashboard" onclick="switchTab('dashboard')">📊 Dashboard</button>
-      <button class="tab" data-tab="allTickets" onclick="switchTab('allTickets')">📋 Tickets</button>
+      <button class="tab" data-tab="allTickets" onclick="switchTab('allTickets')">📋 Tickets <span id="tabTicketStat" style="font-size:10px;font-weight:600;margin-left:4px;"></span></button>
       <button class="tab" data-tab="export" onclick="switchTab('export')">📄 Export</button>
       <button class="tab" data-tab="manage" onclick="switchTab('manage')">⚙️ จัดการ</button>
       <button class="tab" data-tab="archive" onclick="switchTab('archive')">📁 Archive</button>
@@ -1138,20 +1278,24 @@ function renderAdminTickets() {
   const c = document.getElementById('tab-allTickets');
   const depts = [...new Set(state.tickets.map(t => t.deptName))].filter(Boolean);
   const cats = [...new Set(state.tickets.map(t => t.category))].filter(Boolean);
+  const busInUse = [...new Set(state.tickets.map(t => t.bu))].filter(Boolean);
+  state.adminPage = 1;
   c.innerHTML = `
     <div class="filter-bar">
       <div class="form-group" style="flex:2;min-width:170px;"><label>🔍 ค้นหา</label>
-        <input type="text" class="form-control" id="atSearch" placeholder="คำค้น..." oninput="renderAdminTicketsList()"></div>
+        <input type="text" class="form-control" id="atSearch" placeholder="คำค้น..." oninput="onAdminFilterChange()"></div>
       <div class="form-group"><label>แผนก</label>
-        <select class="form-control" id="atDept" onchange="renderAdminTicketsList()"><option value="">ทั้งหมด</option>${depts.map(d => `<option>${escapeHtml(d)}</option>`).join('')}</select></div>
+        <select class="form-control" id="atDept" onchange="onAdminFilterChange()"><option value="">ทั้งหมด</option>${depts.map(d => `<option>${escapeHtml(d)}</option>`).join('')}</select></div>
+      ${busInUse.length ? `<div class="form-group"><label>🏷️ BU</label>
+        <select class="form-control" id="atBU" onchange="onAdminFilterChange()"><option value="">ทั้งหมด</option>${busInUse.map(b => `<option>${escapeHtml(b)}</option>`).join('')}</select></div>` : ''}
       <div class="form-group"><label>หมวดหมู่</label>
-        <select class="form-control" id="atCat" onchange="renderAdminTicketsList()"><option value="">ทั้งหมด</option>${cats.map(x => `<option>${escapeHtml(x)}</option>`).join('')}</select></div>
+        <select class="form-control" id="atCat" onchange="onAdminFilterChange()"><option value="">ทั้งหมด</option>${cats.map(x => `<option>${escapeHtml(x)}</option>`).join('')}</select></div>
       <div class="form-group"><label>สถานะ</label>
-        <select class="form-control" id="atStatus" onchange="renderAdminTicketsList()">
+        <select class="form-control" id="atStatus" onchange="onAdminFilterChange()">
           <option value="">ทั้งหมด</option><option value="pending">รอดำเนินการ</option>
           <option value="inProgress">กำลังดำเนินการ</option><option value="resolved">แล้วเสร็จ</option></select></div>
       <div class="form-group"><label>เร่งด่วน</label>
-        <select class="form-control" id="atPrio" onchange="renderAdminTicketsList()">
+        <select class="form-control" id="atPrio" onchange="onAdminFilterChange()">
           <option value="">ทั้งหมด</option><option value="urgent">เร่งด่วน</option>
           <option value="normal">ปกติ</option><option value="low">ไม่เร่งด่วน</option></select></div>
       <div class="form-group"><label>&nbsp;</label><button class="btn btn-secondary" onclick="loadAdminTickets()">🔄</button></div>
@@ -1163,6 +1307,7 @@ function renderAdminTickets() {
       <span id="listCount" style="font-size:12px;color:var(--gray-500);"></span>
     </div>
     <div class="ticket-list" id="adminTicketList"></div>
+    <div id="adminPager" style="text-align:center;margin-top:12px;"></div>
     <div class="bulk-bar" id="bulkBar">
       <span>เลือก <strong id="bulkCount">0</strong> รายการ</span>
       <select id="bulkStatus">
@@ -1176,27 +1321,41 @@ function renderAdminTickets() {
   renderAdminTicketsList();
 }
 
+function onAdminFilterChange() { state.adminPage = 1; renderAdminTicketsList(); }
+
 function getFilteredAdminList() {
   const q = document.getElementById('atSearch')?.value.trim() || '';
   const fd = document.getElementById('atDept')?.value || '';
+  const fb = document.getElementById('atBU')?.value || '';
   const fc = document.getElementById('atCat')?.value || '';
   const fs = document.getElementById('atStatus')?.value || '';
   const fp = document.getElementById('atPrio')?.value || '';
   let list = state.tickets;
   if (fd) list = list.filter(t => t.deptName === fd);
+  if (fb) list = list.filter(t => t.bu === fb);
   if (fc) list = list.filter(t => t.category === fc);
   if (fs) list = list.filter(t => t.status === fs);
   if (fp) list = list.filter(t => t.priority === fp);
   return list.filter(t => ticketMatchesSearch(t, q));
 }
 
+const ADMIN_PAGE_SIZE = 50;
 function renderAdminTicketsList() {
   const list = getFilteredAdminList();
   const c = document.getElementById('adminTicketList');
   document.getElementById('listCount').textContent = 'พบ ' + list.length + ' รายการ';
-  if (!list.length) { c.innerHTML = '<div class="empty-state"><div class="title">ไม่มี Ticket ตรงเงื่อนไข</div></div>'; return; }
-  c.innerHTML = list.map(t => ticketCardHTML(t, { selectable: true, highlight: state.highlightUnread.has(t.ticketId) })).join('');
+  if (!list.length) { c.innerHTML = '<div class="empty-state"><div class="title">ไม่มี Ticket ตรงเงื่อนไข</div></div>'; document.getElementById('adminPager').innerHTML = ''; return; }
+  const page = state.adminPage || 1;
+  const shown = list.slice(0, page * ADMIN_PAGE_SIZE);
+  c.innerHTML = shown.map(t => ticketCardHTML(t, { selectable: true, highlight: state.highlightUnread.has(t.ticketId) })).join('');
+  const pager = document.getElementById('adminPager');
+  if (shown.length < list.length) {
+    pager.innerHTML = `<button class="btn btn-secondary" onclick="loadMoreAdmin()">โหลดเพิ่ม (${shown.length}/${list.length})</button>`;
+  } else {
+    pager.innerHTML = list.length > ADMIN_PAGE_SIZE ? `<span style="font-size:12px;color:var(--gray-400);">แสดงครบ ${list.length} รายการ</span>` : '';
+  }
 }
+function loadMoreAdmin() { state.adminPage = (state.adminPage || 1) + 1; renderAdminTicketsList(); }
 
 function toggleSelect(id, chk) {
   if (chk.checked) state.selectedTickets.add(id);
@@ -1277,6 +1436,9 @@ async function renderDashboardData() {
   const s = r.combined;
   const multi = siteIds.length > 1;
   const avgRating = s.ratingCount ? (s.ratingSum / s.ratingCount).toFixed(1) : '-';
+  const avgResolveHrs = s.resolveTimeCount ? (s.resolveTimeSum / s.resolveTimeCount / 3600000) : null;
+  const buKeys = Object.keys(s.byBU || {});
+  const showBU = buKeys.length > 1;
 
   const perSiteRow = multi ? `
     <div class="card" style="margin-bottom:14px;">
@@ -1299,8 +1461,19 @@ async function renderDashboardData() {
       <div class="stat-card inProgress"><div class="stat-label">กำลังดำเนินการ</div><div class="stat-value">${s.inProgress}</div></div>
       <div class="stat-card resolved"><div class="stat-label">แล้วเสร็จ</div><div class="stat-value">${s.resolved}</div></div>
       <div class="stat-card rating"><div class="stat-label">⭐ ความพึงพอใจ</div><div class="stat-value">${avgRating}</div><div class="stat-sub">${s.ratingCount} รีวิว</div></div>
+      ${avgResolveHrs != null ? `<div class="stat-card inProgress"><div class="stat-label">⏱️ เวลาแก้เฉลี่ย</div><div class="stat-value" style="font-size:20px;">${fmtDuration(Math.round(avgResolveHrs*10)/10)}</div><div class="stat-sub">${s.resolveTimeCount} งานที่ปิด</div></div>` : ''}
     </div>
     ${perSiteRow}
+    ${showBU ? `
+    <div class="card" style="margin-bottom:14px;">
+      <div class="card-title">🏷️ แยกตาม BU</div>
+      <div class="dept-table"><table>
+        <thead><tr><th>BU</th><th style="text-align:right;">จำนวน Ticket</th><th style="text-align:right;">สัดส่วน</th></tr></thead>
+        <tbody>${buKeys.sort((a,b) => s.byBU[b]-s.byBU[a]).map(bu => `
+          <tr><td><strong>${escapeHtml(bu)}</strong></td><td style="text-align:right;">${s.byBU[bu]}</td>
+          <td style="text-align:right;">${s.total ? Math.round(s.byBU[bu]/s.total*100) : 0}%</td></tr>`).join('')}</tbody>
+      </table></div>
+    </div>` : ''}
     ${s.sla.length ? `
     <div class="card" style="margin-bottom:14px;">
       <div class="card-title">⏰ Ticket ค้างนานสุด (SLA)</div>
@@ -1322,6 +1495,7 @@ async function renderDashboardData() {
       <div class="chart-card"><h3>📊 ปัญหาตามหมวดหมู่</h3><div class="chart-container"><canvas id="chCat"></canvas></div></div>
       <div class="chart-card"><h3>🍩 สัดส่วนตามแผนก</h3><div class="chart-container"><canvas id="chDept"></canvas></div></div>
     </div>
+    ${showBU ? `<div class="chart-card" style="margin-bottom:14px;"><h3>🏷️ ปัญหาตาม BU</h3><div class="chart-container"><canvas id="chBU"></canvas></div></div>` : ''}
     <div class="chart-card" style="margin-bottom:14px;"><h3>📈 แนวโน้มรายเดือน</h3><div class="chart-container"><canvas id="chTime"></canvas></div></div>
     <div class="chart-card"><h3>🔝 Top 10 หมวดย่อย</h3><div class="chart-container tall"><canvas id="chSub"></canvas></div></div>`;
 
@@ -1357,6 +1531,16 @@ function renderCharts(r, siteIds, multi) {
     type:'doughnut', data:{ labels: dLabels, datasets:[{ data: dLabels.map(k => s.byDept[k]), backgroundColor: colors }] },
     options:{ responsive:true, maintainAspectRatio:false, plugins:{ legend:{ position:'right' } } }
   });
+
+  // BU chart (ถ้ามีมากกว่า 1 BU)
+  const buCanvas = document.getElementById('chBU');
+  if (buCanvas && s.byBU) {
+    const buLabels = Object.keys(s.byBU).sort((a,b) => s.byBU[b]-s.byBU[a]);
+    charts.bu = new Chart(buCanvas, {
+      type:'bar', data:{ labels: buLabels, datasets:[{ label:'จำนวน', data: buLabels.map(k => s.byBU[k]), backgroundColor: colors, borderRadius:6 }] },
+      options:{ responsive:true, maintainAspectRatio:false, plugins:{ legend:{ display:false } }, scales:{ y:{ beginAtZero:true, ticks:{ precision:0 } } } }
+    });
+  }
 
   const tLabels = Object.keys(s.timeline).sort();
   let timeDatasets;
@@ -1398,6 +1582,7 @@ function loadExportPanel() {
       <div id="exportButtons" style="display:none;gap:10px;margin-top:12px;flex-wrap:wrap;">
         <button class="btn btn-success" onclick="doExportPDF('detail')">📄 PDF รายละเอียด</button>
         <button class="btn btn-warning" onclick="doExportPDF('summary')">📋 PDF สรุป (แนวนอน)</button>
+        <button class="btn btn-primary" onclick="doExportExcel()">📊 Excel (.xls)</button>
       </div>
     </div>`;
 }
@@ -1422,6 +1607,34 @@ function previewExport() {
     ${list.slice(0,5).map(t => `<div style="padding:3px 0;">• ${escapeHtml(t.ticketId)} — ${escapeHtml(t.title)}</div>`).join('')}
     ${list.length > 5 ? `<div style="color:var(--gray-500);margin-top:4px;">... และอีก ${list.length-5} รายการ</div>` : ''}`;
   document.getElementById('exportButtons').style.display = 'flex';
+}
+
+function doExportExcel() {
+  const { list, filterText } = getExportFiltered();
+  if (!list.length) { toast('ไม่มีข้อมูล', '', 'warning'); return; }
+  const headers = ['TicketID','วันที่แจ้ง','สถานะ','ความเร่งด่วน','BU','แผนก','หมวดหมู่','หมวดย่อย','ชื่อปัญหา','รายละเอียด','ผู้แจ้ง','เบอร์โทร','ผู้รับผิดชอบ','หมายเหตุ Admin','เริ่มทำ','ปิดงาน','เวลาแก้(ชม.)','คะแนน'];
+  const rows = list.map(t => [
+    t.ticketId, t.createdAt, statusText(t.status), prioText(t.priority).replace(/[🔴🟡🟢]/g,'').trim(),
+    t.bu, t.deptName, t.category, t.subCategory, t.title, t.description,
+    t.reporterName, t.phone, t.assignedTo, t.adminNote,
+    t.startedAt, t.resolvedAt, t.resolveDurationHrs, t.rating
+  ]);
+  // สร้างไฟล์ .xls แบบ HTML table (Excel เปิดได้ รองรับ UTF-8 ไทย)
+  let table = '<table border="1"><thead><tr>' + headers.map(h => `<th style="background:#2563eb;color:#fff;">${escapeHtml(h)}</th>`).join('') + '</tr></thead><tbody>';
+  rows.forEach(r => {
+    table += '<tr>' + r.map(c => `<td>${escapeHtml(String(c==null?'':c))}</td>`).join('') + '</tr>';
+  });
+  table += '</tbody></table>';
+  const html = `<html xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:x="urn:schemas-microsoft-com:office:excel" xmlns="http://www.w3.org/TR/REC-html40">
+    <head><meta charset="UTF-8"><!--[if gte mso 9]><xml><x:ExcelWorkbook><x:ExcelWorksheets><x:ExcelWorksheet><x:Name>Tickets</x:Name><x:WorksheetOptions><x:DisplayGridlines/></x:WorksheetOptions></x:ExcelWorksheet></x:ExcelWorksheets></x:ExcelWorkbook></xml><![endif]--></head>
+    <body><h3>${escapeHtml(state.user.siteName)} — Ticket Report (${escapeHtml(filterText)})</h3>${table}</body></html>`;
+  const blob = new Blob(['\ufeff' + html], { type: 'application/vnd.ms-excel;charset=utf-8;' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'Ticket_' + state.user.siteId + '_' + new Date().toISOString().slice(0,10) + '.xls';
+  a.click();
+  URL.revokeObjectURL(a.href);
+  toast('Export Excel เสร็จแล้ว', list.length + ' รายการ', 'success');
 }
 
 function doExportPDF(mode) {
@@ -1556,6 +1769,7 @@ async function loadBUMgmt() {
   const r = await apiGet('getBUs', { siteId: state.user.siteId });
   if (!r.ok) { c.innerHTML = '<div class="empty-state"><div class="title">โหลดไม่สำเร็จ</div></div>'; return; }
   state.bus = r.bus;
+  writeCache(state.user.siteId, 'bu', r.bus);
   c.innerHTML = `
     <div class="card" style="margin-bottom:12px;">
       <div class="card-title">➕ เพิ่ม BU</div>
@@ -1699,6 +1913,7 @@ async function loadCategoryMgmt() {
   const r = await apiGet('getCategories', { siteId: state.user.siteId });
   if (!r.ok) { c.innerHTML = '<div class="empty-state"><div class="title">โหลดไม่สำเร็จ</div></div>'; return; }
   state.categories = r.categories;
+  writeCache(state.user.siteId, 'cat', r.categories);
   const mains = [...new Set(r.categories.map(x => x.main))];
   c.innerHTML = `
     <div class="card" style="margin-bottom:12px;">
@@ -1996,7 +2211,35 @@ function startAdminPoll() {
   };
   state.pollNow = poll;
   poll();
-  state.pollTimer = setInterval(poll, 30000);
+  startAdaptivePoll(poll, 30000);
+}
+
+/* polling อัจฉริยะ: ใช้ interval ปกติเมื่อ active, ยืดเป็น 3 เท่าเมื่อไม่ได้แตะเกิน 3 นาที
+   หรือแท็บถูกซ่อน → ลด load server โดยไม่กระทบการแจ้งเตือนตอนใช้งานจริง */
+function startAdaptivePoll(pollFn, baseMs) {
+  if (state.pollTimer) clearInterval(state.pollTimer);
+  let lastRun = Date.now();
+  state.pollTimer = setInterval(() => {
+    const idleMs = Date.now() - lastActivity;
+    const hidden = document.hidden;
+    // ถ้าไม่ active (เกิน 3 นาที) หรือแท็บซ่อน → poll ทุก baseMs*3
+    const effectiveInterval = (hidden || idleMs > 180000) ? baseMs * 3 : baseMs;
+    if (Date.now() - lastRun >= effectiveInterval) {
+      lastRun = Date.now();
+      pollFn();
+    }
+  }, Math.min(baseMs, 15000)); // ตรวจทุก 15 วิ หรือ baseMs (อันไหนน้อยกว่า)
+}
+
+function updateTabTicketStat(tickets) {
+  const el = document.getElementById('tabTicketStat');
+  if (!el) return;
+  let p = 0, i = 0;
+  tickets.forEach(t => { if (t.status === 'pending') p++; else if (t.status === 'inProgress') i++; });
+  const parts = [];
+  if (p > 0) parts.push(`<span style="color:#92400e;">รอ ${p}</span>`);
+  if (i > 0) parts.push(`<span style="color:#1e40af;">ทำ ${i}</span>`);
+  el.innerHTML = parts.length ? '(' + parts.join(' | ') + ')' : '';
 }
 
 function processAdminPoll(tickets, readKey) {
@@ -2021,6 +2264,9 @@ function processAdminPoll(tickets, readKey) {
   });
 
   state.knownSnapshot = nextSnapshot;
+
+  // อัปเดตตัวเลขสถานะบนแท็บ Tickets (ทุก poll)
+  updateTabTicketStat(tickets);
 
   if (!state.primed) { state.primed = true; return; }
 
@@ -2057,7 +2303,7 @@ function startUserPoll() {
   };
   state.pollNow = poll;
   poll();
-  state.pollTimer = setInterval(poll, 60000);
+  startAdaptivePoll(poll, 60000);
 }
 
 function processUserPoll(tickets) {
