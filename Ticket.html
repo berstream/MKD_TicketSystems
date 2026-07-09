@@ -270,7 +270,7 @@ code { background:var(--gray-100); padding:2px 6px; border-radius:5px; font-size
 <header class="topbar">
   <h1><span class="logo" id="siteBadge">🎫</span> <span id="appTitle">Ticket System</span></h1>
   <div class="topbar-right" id="topbarRight" style="display:none;">
-    <button class="btn-topbar off" id="soundToggle" onclick="toggleSound()"><span id="soundIcon">🔕</span> <span id="soundLabel">เปิดเสียง</span></button>
+    <button class="btn-topbar" id="soundToggle" onclick="toggleSound()"><span id="soundIcon">🔔</span> <span id="soundLabel">เสียงเปิด</span></button>
     <button class="btn-icon" id="bellBtn" onclick="toggleNotifDropdown()" style="display:none;">🔔<span class="badge" id="bellBadge" style="display:none;">0</span></button>
     <div class="notif-dropdown" id="notifDropdown">
       <div class="notif-header">การแจ้งเตือน (ยังไม่อ่าน)</div>
@@ -356,7 +356,7 @@ let state = {
   pollTimer: null, pollNow: null, idleTimer: null,
   notifTickets: [], readTicketIds: new Set(), knownSnapshot: {}, primed: false,
   updatedTicketIds: new Set(), highlightUnread: new Set(),
-  soundOn: false, audioCtx: null,
+  soundOn: true, audioCtx: null,
   selectedTickets: new Set(),
   dashSites: new Set(), filters: {},
   allPositions: [], showPasswords: false,
@@ -422,7 +422,31 @@ function removeToast(el) {
   setTimeout(() => el.remove(), 300);
 }
 
-/* ═══════ SOUND ═══════ */
+/* ═══════ SOUND ═══════
+   ค่าเริ่มต้น = เปิดเสมอ (เว้นแต่ผู้ใช้เคยกดปิดเองไว้ก่อน — จำใน localStorage)
+   เบราว์เซอร์บล็อกเสียงจนกว่าจะมี interaction ก่อน จึงต้อง initAudio()
+   ทันทีที่มีการคลิก/แตะครั้งแรกในหน้า โดยไม่ต้องรอผู้ใช้กดปุ่มเสียงเอง */
+const SOUND_PREF_KEY = 'tk_sound_pref';
+function loadSoundPref() {
+  try {
+    const saved = localStorage.getItem(SOUND_PREF_KEY);
+    return saved === null ? true : saved === 'on'; // ไม่เคยตั้ง = เปิด (ค่าเริ่มต้น)
+  } catch(e) { return true; }
+}
+function saveSoundPref(on) {
+  try { localStorage.setItem(SOUND_PREF_KEY, on ? 'on' : 'off'); } catch(e) {}
+}
+function armAudioOnFirstInteraction() {
+  const arm = () => {
+    if (state.soundOn) initAudio();
+    document.removeEventListener('click', arm);
+    document.removeEventListener('keydown', arm);
+    document.removeEventListener('touchstart', arm);
+  };
+  document.addEventListener('click', arm, { once: true, passive: true });
+  document.addEventListener('keydown', arm, { once: true, passive: true });
+  document.addEventListener('touchstart', arm, { once: true, passive: true });
+}
 function initAudio() {
   if (!state.audioCtx) { try { state.audioCtx = new (window.AudioContext||window.webkitAudioContext)(); } catch(e) {} }
   if (state.audioCtx && state.audioCtx.state === 'suspended') state.audioCtx.resume();
@@ -445,6 +469,7 @@ function toggleSound() {
     document.getElementById('soundIcon').textContent = '🔔';
     document.getElementById('soundLabel').textContent = 'เสียงเปิด';
     document.getElementById('soundToggle').classList.remove('off');
+    saveSoundPref(true);
     setTimeout(playDing, 100);
     toast('เปิดเสียงแจ้งเตือนแล้ว', '', 'success');
   } else {
@@ -452,6 +477,7 @@ function toggleSound() {
     document.getElementById('soundIcon').textContent = '🔕';
     document.getElementById('soundLabel').textContent = 'เปิดเสียง';
     document.getElementById('soundToggle').classList.add('off');
+    saveSoundPref(false);
   }
 }
 
@@ -2438,6 +2464,16 @@ async function submitChangePassword() {
 
 /* ═══════ INIT (โหลดหน้า / กู้ session) ═══════ */
 document.addEventListener('DOMContentLoaded', async () => {
+  // โหลดค่าเสียงที่จำไว้ (ค่าเริ่มต้น = เปิด) + เตรียมเสียงให้พร้อมทันทีที่มีการคลิกครั้งแรก
+  state.soundOn = loadSoundPref();
+  if (!state.soundOn) {
+    const icon = document.getElementById('soundIcon'), label = document.getElementById('soundLabel'), btn = document.getElementById('soundToggle');
+    if (icon) icon.textContent = '🔕';
+    if (label) label.textContent = 'เปิดเสียง';
+    if (btn) btn.classList.add('off');
+  }
+  armAudioOnFirstInteraction();
+
   const sess = loadSession();
   if (sess && sess.superMode) {
     state.superMode = true; state.superKey = sess.superKey;
