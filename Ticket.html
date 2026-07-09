@@ -943,8 +943,10 @@ function renderMyTickets() {
   if (state.tickets.length === 0) {
     c.innerHTML = '<div class="empty-state"><div class="icon">📭</div><div class="title">ยังไม่มี Ticket</div></div>'; return;
   }
-  const g = { pending:[], inProgress:[], resolved:[] };
+  const g = { pending:[], inProgress:[], resolved:[], pendingApproval:[], approved:[], rejected:[] };
   state.tickets.forEach(t => (g[t.status] || g.pending).push(t));
+  const myName = state.user.position;
+  const myCount = state.tickets.filter(t => t.reporterName === myName).length;
   c.innerHTML = `
     <div class="filter-bar">
       <div class="form-group" style="flex:2;min-width:180px;">
@@ -957,9 +959,19 @@ function renderMyTickets() {
           <option value="pending">รอดำเนินการ (${g.pending.length})</option>
           <option value="inProgress">กำลังดำเนินการ (${g.inProgress.length})</option>
           <option value="resolved">แล้วเสร็จ (${g.resolved.length})</option>
+          ${g.pendingApproval.length ? `<option value="pendingApproval">⏳ รออนุมัติ (${g.pendingApproval.length})</option>` : ''}
+          ${g.approved.length ? `<option value="approved">✅ อนุมัติแล้ว (${g.approved.length})</option>` : ''}
+          ${g.rejected.length ? `<option value="rejected">❌ ไม่อนุมัติ (${g.rejected.length})</option>` : ''}
         </select></div>
       <div class="form-group"><label>&nbsp;</label>
         <button class="btn btn-secondary" onclick="loadMyTickets()">🔄</button></div>
+    </div>
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;padding:0 4px;">
+      <label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer;user-select:none;">
+        <input type="checkbox" id="myOnlyChk" onchange="renderMyTicketsList()" style="width:16px;height:16px;accent-color:var(--primary);">
+        🙋 เฉพาะที่ฉันแจ้ง (${myCount})
+      </label>
+      <span id="myListCount" style="font-size:12px;color:var(--gray-500);"></span>
     </div>
     <div class="ticket-list" id="myTicketList"></div>
     <div id="myPager" style="text-align:center;margin-top:12px;"></div>`;
@@ -978,10 +990,15 @@ const MY_PAGE_SIZE = 50;
 function renderMyTicketsList() {
   const f = document.getElementById('myFilterStatus')?.value || '';
   const q = document.getElementById('myFilterSearch')?.value.trim() || '';
+  const onlyMine = document.getElementById('myOnlyChk')?.checked || false;
+  const myName = state.user.position;
   const list = document.getElementById('myTicketList');
   const pager = document.getElementById('myPager');
+  const countEl = document.getElementById('myListCount');
   let filtered = f ? state.tickets.filter(t => t.status === f) : state.tickets;
+  if (onlyMine) filtered = filtered.filter(t => t.reporterName === myName);
   filtered = filtered.filter(t => ticketMatchesSearch(t, q));
+  if (countEl) countEl.textContent = 'พบ ' + filtered.length + ' รายการ';
   if (!filtered.length) { list.innerHTML = '<div class="empty-state"><div class="title">ไม่มีรายการ</div></div>'; if (pager) pager.innerHTML = ''; return; }
   const page = state.myPage || 1;
   const shown = filtered.slice(0, page * MY_PAGE_SIZE);
@@ -2585,32 +2602,100 @@ async function loadPendingApprovals() {
   const c = document.getElementById('tab-pendingAppr');
   if (!c) return;
   c.innerHTML = '<div class="loading-page"><span class="loading"></span> กำลังโหลด...</div>';
-  // IT Admin ส่ง adminKey (ดูได้ทั้งหมด), Approver ส่ง positionId
   const params = { siteId: state.user.siteId };
   if (state.user.isAdmin) params.adminKey = state.user.adminKey;
   else params.positionId = state.user.positionId;
   const r = await apiGet(state.user.isAdmin ? 'getAllTickets' : 'getPendingApprovals', params);
   if (!r.ok) { c.innerHTML = '<div class="empty-state"><div class="icon">⚠️</div><div class="title">โหลดไม่สำเร็จ</div></div>'; return; }
-  let list = r.tickets || [];
-  // IT Admin: กรองเฉพาะ pendingApproval
-  if (state.user.isAdmin) list = list.filter(t => t.status === 'pendingApproval');
-  updateApproverBadge(list.length);
-  if (!list.length) {
-    c.innerHTML = `<div class="card"><div style="text-align:center;padding:40px 20px;">
-      <div style="font-size:48px;margin-bottom:12px;">✅</div>
-      <div style="font-size:16px;font-weight:600;color:var(--gray-700);">ไม่มีคำขอรออนุมัติ</div>
-      <div style="font-size:12px;color:var(--gray-500);margin-top:6px;">พอมีคำขอใหม่ ระบบจะแจ้งเตือน</div>
-    </div></div>`;
-    return;
+  let pending = [], history = [];
+  if (state.user.isAdmin) {
+    // IT Admin: แยก pending vs history จาก getAllTickets
+    (r.tickets || []).forEach(t => {
+      if (t.status === 'pendingApproval') pending.push(t);
+      else if (t.status === 'approved' || t.status === 'rejected') history.push(t);
+    });
+    // เพิ่ม approved/rejected จาก Archive ถ้ามี
+    history.sort((a,b) => parseDateMs(b.approvedAt || b.updatedAt) - parseDateMs(a.approvedAt || a.updatedAt));
+  } else {
+    pending = r.tickets || [];
+    history = r.history || [];
   }
-  c.innerHTML = `
+  updateApproverBadge(pending.length);
+  const pendingHtml = pending.length ? `
     <div class="card" style="margin-bottom:12px;padding:12px 16px;background:#fef3c7;border-left:4px solid #f59e0b;">
-      <div style="font-weight:700;color:#78350f;">⏳ รออนุมัติ ${list.length} คำขอ</div>
+      <div style="font-weight:700;color:#78350f;">⏳ รออนุมัติ ${pending.length} คำขอ</div>
       <div style="font-size:12px;color:#92400e;margin-top:4px;">
         ${state.user.isAdmin ? 'คุณเป็น IT Admin — อนุมัติแทนได้ (ระบบจะบันทึกว่าอนุมัติแทน)' : 'ติกอนุมัติ / ไม่อนุมัติในแต่ละคำขอ'}
       </div>
     </div>
-    <div class="ticket-list">${list.map(renderApprovalCard).join('')}</div>`;
+    <div class="ticket-list">${pending.map(renderApprovalCard).join('')}</div>
+  ` : `<div class="card"><div style="text-align:center;padding:30px 20px;">
+      <div style="font-size:40px;margin-bottom:8px;">✅</div>
+      <div style="font-size:15px;font-weight:600;color:var(--gray-700);">ไม่มีคำขอรออนุมัติ</div>
+      <div style="font-size:12px;color:var(--gray-500);margin-top:6px;">พอมีคำขอใหม่ ระบบจะแจ้งเตือน</div>
+    </div></div>`;
+  const historyHtml = history.length ? `
+    <div style="margin-top:18px;">
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;padding:0 4px;">
+        <h3 style="margin:0;font-size:15px;color:var(--gray-700);">📜 ประวัติการอนุมัติ</h3>
+        <span style="font-size:12px;color:var(--gray-500);">(${history.length} รายการ)</span>
+        <div style="flex:1;"></div>
+        <input type="text" id="apprHistorySearch" class="form-control" placeholder="🔍 ค้นหา..." oninput="renderApprovalHistory()" style="max-width:200px;font-size:12px;padding:6px 10px;">
+        <select id="apprHistoryFilter" class="form-control" onchange="renderApprovalHistory()" style="max-width:150px;font-size:12px;padding:6px 10px;">
+          <option value="">ทั้งหมด</option>
+          <option value="approved">✅ อนุมัติ</option>
+          <option value="rejected">❌ ไม่อนุมัติ</option>
+          <option value="mine">🙋 ที่ฉันตัดสิน</option>
+        </select>
+      </div>
+      <div id="apprHistoryList" class="ticket-list"></div>
+    </div>` : '';
+  c.innerHTML = pendingHtml + historyHtml;
+  state.apprHistoryCache = history;
+  if (history.length) renderApprovalHistory();
+}
+
+function renderApprovalHistory() {
+  const box = document.getElementById('apprHistoryList');
+  if (!box) return;
+  const q = (document.getElementById('apprHistorySearch')?.value || '').trim().toLowerCase();
+  const filter = document.getElementById('apprHistoryFilter')?.value || '';
+  const myName = state.user.position;
+  let list = state.apprHistoryCache || [];
+  if (filter === 'approved') list = list.filter(t => t.status === 'approved');
+  else if (filter === 'rejected') list = list.filter(t => t.status === 'rejected');
+  else if (filter === 'mine') list = list.filter(t => t.approvedBy && String(t.approvedBy).includes(myName));
+  if (q) list = list.filter(t => ticketMatchesSearch(t, q));
+  if (!list.length) { box.innerHTML = '<div class="empty-state" style="padding:20px;"><div style="font-size:13px;color:var(--gray-500);">ไม่พบรายการ</div></div>'; return; }
+  box.innerHTML = list.slice(0, 100).map(renderHistoryCard).join('') + (list.length > 100 ? `<div style="text-align:center;padding:10px;font-size:12px;color:var(--gray-500);">แสดง 100 จาก ${list.length} รายการ (ใช้ตัวกรองเพื่อดูเพิ่ม)</div>` : '');
+}
+
+function renderHistoryCard(t) {
+  const isApproved = t.status === 'approved';
+  const color = isApproved ? '#10b981' : '#ef4444';
+  const bg = isApproved ? '#d1fae5' : '#fee2e2';
+  const txt = isApproved ? '✅ อนุมัติ' : '❌ ไม่อนุมัติ';
+  const txtColor = isApproved ? '#065f46' : '#991b1b';
+  return `
+    <div class="ticket-card" style="border-left:4px solid ${color};padding:12px;cursor:pointer;" onclick="openTicketDetail('${t.ticketId}')">
+      <div style="display:flex;align-items:flex-start;gap:10px;">
+        <div style="flex:1;min-width:0;">
+          <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px;flex-wrap:wrap;">
+            <span style="font-size:11px;padding:2px 8px;border-radius:10px;background:${bg};color:${txtColor};font-weight:600;">${txt}</span>
+            ${t._archived ? '<span style="font-size:10px;color:var(--gray-500);">📁 เก็บแล้ว</span>' : ''}
+            <span style="font-size:11px;color:var(--gray-500);">${escapeHtml(String(t.approvedAt || t.updatedAt))}</span>
+          </div>
+          <div style="font-weight:600;font-size:14px;margin-bottom:4px;">${escapeHtml(t.title)}</div>
+          <div style="font-size:11px;color:var(--gray-600);">
+            📂 ${escapeHtml(t.category)} → ${escapeHtml(t.subCategory)} • 👤 ${escapeHtml(t.reporterName)}${t.bu ? ' • 🏷️ ' + escapeHtml(t.bu) : ''}
+          </div>
+          <div style="font-size:11px;color:var(--gray-500);margin-top:4px;">
+            ตัดสินโดย: <strong>${escapeHtml(t.approvedBy || '-')}</strong>
+            ${t.rejectionReason ? `<div style="color:#991b1b;margin-top:2px;">เหตุผล: ${escapeHtml(t.rejectionReason)}</div>` : ''}
+          </div>
+        </div>
+      </div>
+    </div>`;
 }
 
 function renderApprovalCard(t) {
