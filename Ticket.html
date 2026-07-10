@@ -1152,6 +1152,13 @@ function renderTicketModal() {
         <input type="text" class="form-control" id="modalAssignee" placeholder="ชื่อ IT ที่รับงาน" value="${escapeHtml(t.assignedTo||'')}"></div></div>
       <div class="detail-row"><div class="label">หมายเหตุ Admin</div><div class="value">
         <textarea class="form-control" id="modalAdminNote" placeholder="บันทึกความคืบหน้า / วิธีแก้">${escapeHtml(t.adminNote||'')}</textarea></div></div>
+      <div class="detail-row"><div class="label">📤 ส่งต่อ CJ IT</div><div class="value">
+        <div style="display:flex;gap:8px;flex-wrap:wrap;">
+          <button class="btn btn-secondary" onclick="copyCJPattern('${t.ticketId}')">📋 คัดลอกข้อความ</button>
+          <button class="btn btn-secondary" onclick="downloadCJWord('${t.ticketId}')">📄 ดาวน์โหลด Word</button>
+        </div>
+        <div style="font-size:11px;color:var(--gray-500);margin-top:6px;">💡 ใช้ format มาตรฐาน CJ IT — copy ไปแปะแชท/อีเมล หรือแนบไฟล์ส่ง CP ได้เลย</div>
+      </div></div>
     ` : (state.user && state.user.isApprover && t.status === 'pendingApproval' ? `
       <div class="detail-row"><div class="label">🛡️ อนุมัติ</div><div class="value">
         <div style="display:flex;gap:8px;">
@@ -2595,6 +2602,81 @@ async function submitChangePassword() {
     saveSession();
     document.getElementById('ticketModal').classList.remove('show');
   } else toast('ไม่สำเร็จ', r.error, 'error');
+}
+
+/* ═══════ ส่งต่อ CJ IT (Pattern มาตรฐาน) ═══════
+   สร้างข้อความ/ไฟล์ตาม format ที่ CP กำหนด — IT Admin ใช้เพื่อเปิดเคสต่อกับ CJ IT ส่วนกลาง */
+function buildCJPattern(t) {
+  const site = state.user.siteName || state.user.siteId;
+  const buLine = t.bu ? `${site} — ${t.bu}` : site;
+  const lines = [
+    `DC / Site / BU        : ${buLine}`,
+    `User Request          : ${t.reporterName || ''}`,
+    `แผนก (Department)     : ${t.deptName || ''}`,
+    `เบอร์โทรศัพท์ (Phone)  : ${t.phone || ''}`,
+    `ระบุรายละเอียดปัญหา    : ${t.description || ''}`,
+    `เอกสาร / รูปภาพแนบ    : ${t.imageUrl || ''}`,
+    `Create Ticket by CJ IT: `
+  ];
+  return lines.join('\n');
+}
+
+async function copyCJPattern(ticketId) {
+  const t = state.currentTicket;
+  if (!t || t.ticketId !== ticketId) return;
+  const text = buildCJPattern(t);
+  try {
+    await navigator.clipboard.writeText(text);
+    toast('📋 คัดลอกแล้ว', 'ไปแปะแชท/อีเมลได้เลย', 'success');
+  } catch(e) {
+    // fallback สำหรับ browser เก่า / iOS ที่ Clipboard API ใช้ไม่ได้ในบางสถานการณ์
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.left = '-9999px';
+    document.body.appendChild(ta);
+    ta.select();
+    try { document.execCommand('copy'); toast('📋 คัดลอกแล้ว', '', 'success'); }
+    catch(e2) { toast('คัดลอกไม่สำเร็จ', 'กรุณาเลือกและ copy เอง', 'error'); }
+    document.body.removeChild(ta);
+  }
+}
+
+function downloadCJWord(ticketId) {
+  const t = state.currentTicket;
+  if (!t || t.ticketId !== ticketId) return;
+  const site = state.user.siteName || state.user.siteId;
+  const buLine = t.bu ? `${site} — ${t.bu}` : site;
+  // สร้าง Word file แบบ HTML-based (.doc) — Word เปิดได้ รองรับภาษาไทย
+  const rows = [
+    ['DC / Site / BU', buLine],
+    ['User Request', t.reporterName || ''],
+    ['แผนก (Department)', t.deptName || ''],
+    ['เบอร์โทรศัพท์ (Phone)', t.phone || ''],
+    ['ระบุรายละเอียดปัญหา ที่พบ (Issue)', t.description || ''],
+    ['เอกสาร / รูปภาพแนบ', t.imageUrl ? `<a href="${escapeHtml(t.imageUrl)}">${escapeHtml(t.imageUrl)}</a>` : ''],
+    ['Create Ticket by CJ IT', '']
+  ];
+  const tableRows = rows.map(([k, v]) => `
+    <tr>
+      <td style="width:32%;padding:8px 10px;border:1px solid #999;background:#f3f4f6;font-weight:bold;vertical-align:top;">${escapeHtml(k)}</td>
+      <td style="padding:8px 10px;border:1px solid #999;vertical-align:top;white-space:pre-wrap;">${k==='เอกสาร / รูปภาพแนบ' ? v : escapeHtml(String(v))}</td>
+    </tr>`).join('');
+  const html = `<html xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:w="urn:schemas-microsoft-com:office:word" xmlns="http://www.w3.org/TR/REC-html40">
+<head><meta charset="UTF-8"><title>Ticket ${escapeHtml(t.ticketId)}</title>
+<style>body{font-family:'TH Sarabun New','Sarabun',Tahoma,sans-serif;font-size:16pt;} table{border-collapse:collapse;width:100%;}</style>
+</head><body>
+<h2 style="margin:0 0 12px 0;">Ticket Request — ${escapeHtml(t.ticketId)}</h2>
+<table>${tableRows}</table>
+<p style="font-size:11pt;color:#666;margin-top:20px;">สร้างจาก Ticket System • ${escapeHtml(String(t.createdAt))}</p>
+</body></html>`;
+  const blob = new Blob(['\ufeff' + html], { type: 'application/msword;charset=utf-8;' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `Ticket_${t.ticketId}_${state.user.siteId}.doc`;
+  a.click();
+  URL.revokeObjectURL(a.href);
+  toast('📄 ดาวน์โหลดเสร็จ', a.download, 'success');
 }
 
 /* ═══════ APPROVAL SYSTEM ═══════ */
